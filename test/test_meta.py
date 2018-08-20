@@ -69,7 +69,7 @@ def _make_metadata(name):
     sources = {
         'osm': Source('osm', 'openstreetmap.org'),
         'ne': Source('ne', 'naturalearthdata.com'),
-        'wof': Source('wof', 'whosonfirst.mapzen.com'),
+        'wof': Source('wof', 'whosonfirst.org'),
         'shp': Source('shp', 'openstreetmapdata.com'),
     }
     return make_metadata(sources[name])
@@ -82,11 +82,12 @@ class CallFuncTest(unittest.TestCase):
         cls.layer_data, cls.by_name = make_layer_data_props()
 
     def test_layer_data_count(self):
-        self.assertEquals(9, len(self.layer_data))
+        self.assertEquals(10, len(self.layer_data))
 
     def test_layer_names(self):
         exp_layers = set(('landuse', 'pois', 'transit', 'water', 'places',
-                          'boundaries', 'buildings', 'roads', 'earth'))
+                          'boundaries', 'buildings', 'roads', 'earth',
+                          'admin_areas'))
         self.assertEquals(exp_layers, set(self.by_name.keys()))
 
     def test_layers_called_empty_feature(self):
@@ -618,7 +619,7 @@ class PlacesMinZoomTest(unittest.TestCase):
         }
         meta = make_test_metadata()
         out_min_zoom = self.places.fn(shape, props, None, meta)
-        self.assertEquals(2, out_min_zoom)
+        self.assertEquals(1, out_min_zoom)
 
 
 class PoisMinZoomTest(unittest.TestCase):
@@ -755,6 +756,17 @@ class RoundTripRuleTest(unittest.TestCase):
 
         result = fn(shape, props, fid, meta)
         self.assertIsNone(result)
+
+
+class GenerateSQLTest(unittest.TestCase):
+
+    def test_generate_sql(self):
+        from vectordatasource.meta.sql import write_sql
+        from cStringIO import StringIO
+
+        io = StringIO()
+        # this should throw if there's an error.
+        write_sql(io)
 
 
 if __name__ == '__main__':
