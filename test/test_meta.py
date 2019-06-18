@@ -70,7 +70,7 @@ def _make_metadata(name):
         'osm': Source('osm', 'openstreetmap.org'),
         'ne': Source('ne', 'naturalearthdata.com'),
         'wof': Source('wof', 'whosonfirst.org'),
-        'shp': Source('shp', 'openstreetmapdata.com'),
+        'shp': Source('shp', 'osmdata.openstreetmap.de'),
     }
     return make_metadata(sources[name])
 
@@ -154,24 +154,57 @@ class BoundariesTest(unittest.TestCase):
         cls.boundaries = cls.by_name['boundaries']
 
     def test_osm(self):
+        from shapely.geometry import Point
+        shape = Point(0, 0).buffer(1.0)
         props = {
             'boundary': 'administrative',
             'boundary:type': 'aboriginal_lands',
             'admin_level': '2',
         }
         meta = make_test_metadata()
-        out_props = self.boundaries.fn(None, props, None, meta)
+        out_props = self.boundaries.fn(shape, props, None, meta)
         self.assertEquals('aboriginal_lands', out_props.get('kind'))
         self.assertEquals('2', out_props.get('kind_detail'))
 
     def test_ne(self):
+        from shapely.geometry import Point
+        shape = Point(0, 0).buffer(1.0)
         props = {
             'featurecla': 'Admin-1 region boundary',
         }
         meta = make_test_metadata()
-        out_props = self.boundaries.fn(None, props, None, meta)
+        out_props = self.boundaries.fn(shape, props, None, meta)
         self.assertEquals('macroregion', out_props.get('kind'))
         self.assertEquals('3', out_props.get('kind_detail'))
+
+    def test_osm_linestring(self):
+        from shapely.geometry import LineString
+        shape = LineString([(0, 0), (1, 1)])
+        props = {
+            'boundary': 'administrative',
+            'boundary:type': 'aboriginal_lands',
+            'admin_level': '2',
+        }
+        meta = make_test_metadata()
+        out_props = self.boundaries.fn(shape, props, None, meta)
+
+        # we get most admin boundaries from the planet_osm_polygons table, as
+        # the (linestring) boundaries of the country polygons. this means we
+        # need to distinguish between three cases: 1) linestrings from the
+        # lines table, 2) polygons from the polygons table, and 3) linestrings
+        # derived from polygons in the polygons table. we do this with a little
+        # hack, by setting mz_boundary_from_polygon on the derived linestrings.
+
+        # without the hack, shouldn't match (i.e: as if it were from
+        # planet_osm_line)
+        self.assertIsNone(out_props)
+
+        # if we add the hack, it should now match (i.e: as if it were
+        # from planet_osm_polygon with the boundary/RHR query).
+        props['mz_boundary_from_polygon'] = True
+        out_props = self.boundaries.fn(shape, props, None, meta)
+        self.assertEquals('aboriginal_lands', out_props.get('kind'))
+        self.assertEquals('2', out_props.get('kind_detail'))
 
 
 class EarthTest(unittest.TestCase):
@@ -313,33 +346,33 @@ class PlacesTest(unittest.TestCase):
     def test_wof_is_landuse_aoi(self):
         meta = _make_metadata('wof')
 
-        props = dict(is_landuse_aoi=True)
+        props = dict(is_landuse_aoi=True, placetype='neighbourhood')
         out_props = self.places.fn(None, props, None, meta)
         self.assertTrue(out_props.get('is_landuse_aoi'))
 
-        props = dict(is_landuse_aoi=False)
+        props = dict(is_landuse_aoi=False, placetype='neighbourhood')
         out_props = self.places.fn(None, props, None, meta)
         self.assertIsNone(out_props.get('is_landuse_aoi'))
 
-        props = dict(is_landuse_aoi=None)
+        props = dict(is_landuse_aoi=None, placetype='neighbourhood')
         out_props = self.places.fn(None, props, None, meta)
         self.assertIsNone(out_props.get('is_landuse_aoi'))
 
-        props = dict()
+        props = dict(placetype='neighbourhood')
         out_props = self.places.fn(None, props, None, meta)
         self.assertIsNone(out_props.get('is_landuse_aoi'))
 
     def test_wof_area(self):
         meta = _make_metadata('wof')
 
-        props = dict(area=3.14159)
+        props = dict(area=3.14159, placetype='neighbourhood')
         out_props = self.places.fn(None, props, None, meta)
         area = out_props.get('area')
         self.assertIsNotNone(area)
         self.assertTrue(isinstance(area, int))
         self.assertEquals(3, area)
 
-        props = dict(area=None)
+        props = dict(area=None, placetype='neighbourhood')
         out_props = self.places.fn(None, props, None, meta)
         self.assertIsNone(out_props.get('area'))
 
@@ -407,8 +440,11 @@ class RoadsTest(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.layer_data, cls.by_name = make_layer_data_props()
-        cls.roads = cls.by_name['roads']
+        _, props_by_name = make_layer_data_props()
+        _, min_zoom_by_name = make_layer_data_min_zoom()
+
+        cls.roads = props_by_name['roads']
+        cls.roads_min_zoom = min_zoom_by_name['roads']
 
     def test_osm(self):
         props = {
@@ -424,13 +460,17 @@ class RoadsTest(unittest.TestCase):
         props = {
             'featurecla': 'Road',
             'type': 'Road',
-            'scalerank': 2,
+            'min_zoom': 3,
         }
         meta = make_test_metadata()
         out_props = self.roads.fn(None, props, None, meta)
+        min_zoom = self.roads_min_zoom.fn(None, props, None, meta)
         self.assertEquals('major_road', out_props.get('kind'))
         self.assertEquals('secondary', out_props.get('kind_detail'))
-        self.assertEquals(5, out_props.get('min_zoom'))
+        # NOTE: there is a 'min_zoom' in the out_props, but it gets
+        # overwritten with the result of the min_zoom function, which is what
+        # we test here.
+        self.assertEquals(5, min_zoom)
 
 
 class TransitTest(unittest.TestCase):
@@ -518,7 +558,7 @@ class LanduseMinZoomTest(unittest.TestCase):
         }
         meta = make_test_metadata()
         out_min_zoom = self.landuse.fn(shape, props, None, meta)
-        self.assertEquals(9, out_min_zoom)
+        self.assertEquals(13, out_min_zoom)
 
     def test_medium_zoo(self):
         import shapely.geometry
@@ -526,8 +566,8 @@ class LanduseMinZoomTest(unittest.TestCase):
             calculate_1px_zoom
         import math
 
-        target_zoom = 11.0
-        # want a zoom 11 feature, so make one with a triangle.
+        target_zoom = 14.0
+        # want a zoom 14 feature, so make one with a triangle.
         target_area = math.exp((17.256 - target_zoom) * math.log(4))
         # make area with a half-square triangle.
         s = math.sqrt(target_area * 2.0)
@@ -560,6 +600,7 @@ class BoundariesMinZoomTest(unittest.TestCase):
         props = {
             'boundary': 'administrative',
             'admin_level': '2',
+            'mz_boundary_from_polygon': True,  # need this for hack
         }
         meta = make_test_metadata()
         out_min_zoom = self.boundaries.fn(shape, props, None, meta)
@@ -639,7 +680,7 @@ class PoisMinZoomTest(unittest.TestCase):
         }
         meta = make_test_metadata()
         out_min_zoom = self.pois.fn(shape, props, None, meta)
-        self.assertEquals(14, out_min_zoom)
+        self.assertEquals(16, out_min_zoom)
 
 
 class RoadsMinZoomTest(unittest.TestCase):
@@ -694,7 +735,7 @@ class WaterMinZoomTest(unittest.TestCase):
         }
         meta = make_test_metadata()
         out_min_zoom = self.water.fn(shape, props, None, meta)
-        self.assertEquals(16, out_min_zoom)
+        self.assertEquals(17, out_min_zoom)
 
 
 class RoundTripRuleTest(unittest.TestCase):
@@ -715,30 +756,23 @@ class RoundTripRuleTest(unittest.TestCase):
                 output=dict(kind='triggered')
             )],
         )
-        from vectordatasource.meta.python import make_empty_ast_state
+        from vectordatasource.meta.python import FilterCompiler
+        from vectordatasource.meta.python import create_matcher
         from vectordatasource.meta.python import output_kind
-        from vectordatasource.meta.python import make_function_name_props
-        from vectordatasource.meta.python import parse_layer_from_yaml
-        ast_state = make_empty_ast_state()
-        ast_fn = parse_layer_from_yaml(
-            ast_state, yaml_data, 'fn_name', output_kind,
-            make_function_name_props)
 
-        # first check that if we compile the function from the ast, we
-        # get an expected result
-        import ast
-        mod = ast.Module([ast_fn])
-        mod_with_linenos = ast.fix_missing_locations(mod)
-        code = compile(mod_with_linenos, '<string>', 'exec')
-        scope = {}
-        exec code in scope
-        fn = scope['fn_name_props']
+        matchers = []
+        for yaml_datum in yaml_data['filters']:
+            matcher = create_matcher(yaml_datum, output_kind)
+            matchers.append(matcher)
+
+        fc = FilterCompiler()
+        ast_fn, compiled_fn = fc.compile(matchers, 'fn_name_props')
 
         shape = None
         props = dict(some='value')
         fid = 42
         meta = make_test_metadata()
-        result = fn(shape, props, fid, meta)
+        result = compiled_fn(shape, props, fid, meta)
         self.assertIsNone(result)
 
         # now, round trip it through the ast formatter
@@ -747,6 +781,7 @@ class RoundTripRuleTest(unittest.TestCase):
         formatter = astformatter.ASTFormatter()
         code_str = formatter.format(ast_fn, mode='exec')
 
+        import ast
         mod = ast.parse(code_str)
         mod_with_linenos = ast.fix_missing_locations(mod)
         code = compile(mod_with_linenos, '<string>', 'exec')

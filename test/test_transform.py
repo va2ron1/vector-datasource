@@ -225,6 +225,7 @@ class DropFeaturesMinPixelsTest(unittest.TestCase):
             params=params,
             unpadded_bounds=None,
             resources=None,
+            log=None,
         )
         result = drop_features_mz_min_pixels(ctx)
         return result
@@ -258,6 +259,28 @@ class DropFeaturesMinPixelsTest(unittest.TestCase):
         self._call_fut(feature_layers, zoom)
         features = feature_layers[0]['features']
         self.assertEquals(1, len(features))
+
+
+class LanduseSortKeysAreUniqueTest(unittest.TestCase):
+
+    def _check_unique(self, csv_name):
+        import csv
+        import os.path
+
+        landuse_path = os.path.join(
+            os.path.dirname(__file__), '..', 'spreadsheets', 'sort_rank',
+            csv_name)
+        with open(landuse_path) as fh:
+            rows = list(csv.reader(fh))
+            seen = set()
+            for row in rows[1:]:
+                sort_key = int(row[-1])
+                self.assertFalse(sort_key in seen, "Duplicate sort_key "
+                                 "value: %d" % (sort_key,))
+                seen.add(sort_key)
+
+    def test_landuse(self):
+        self._check_unique('landuse.csv')
 
 
 class SortKeyTest(unittest.TestCase):
@@ -330,7 +353,8 @@ class BuildingsUnifyTest(unittest.TestCase):
             nominal_zoom=0,
             unpadded_bounds=None,
             params=dict(source_layer='buildings'),
-            resources=None)
+            resources=None,
+            log=None)
         from vectordatasource.transform import buildings_unify
         buildings_unify(ctx)
         return building_feature_layer['features']
@@ -396,7 +420,8 @@ class DropMergedIdTest(unittest.TestCase):
             nominal_zoom=0,
             unpadded_bounds=None,
             params=dict(source_layer=layer_name),
-            resources=None)
+            resources=None,
+            log=None)
         merged_feature_layer = merge_fn(ctx)
         merged_features = merged_feature_layer['features']
         self.assertEquals(1, len(merged_features))
@@ -505,7 +530,8 @@ class DropMergedIdTest(unittest.TestCase):
             nominal_zoom=0,
             unpadded_bounds=None,
             params=dict(source_layer=layer_name),
-            resources=None)
+            resources=None,
+            log=None)
         merged_feature_layer = merge_polygon_features(ctx)
         merged_features = merged_feature_layer['features']
         self.assertEquals(2, len(merged_features))
@@ -539,8 +565,10 @@ class DropMergedIdTest(unittest.TestCase):
         def _drop_all_props((shape, props, fid)):
             return None
 
+        tolerance = 1.0e-4
         merged_features = _merge_features_by_property(
-            buildings, _POLYGON_DIMENSION, update_props_pre_fn=_drop_all_props)
+            buildings, _POLYGON_DIMENSION, tolerance,
+            update_props_pre_fn=_drop_all_props)
 
         self.assertEquals(2, len(merged_features))
         for f in merged_features:
@@ -651,6 +679,7 @@ class RankBoundsTest(unittest.TestCase):
             unpadded_bounds=bounds,
             params=params,
             resources=None,
+            log=None,
         )
         rank_features(ctx)
         rank = props.get('rank')
@@ -702,7 +731,7 @@ class SimplifyAndClipTest(unittest.TestCase):
         resources = None
 
         ctx = Context(feature_layers, nominal_zoom, unpadded_bounds, params,
-                      resources)
+                      resources, log=None)
         simplify_and_clip(ctx)
 
         self.assertEquals(1, len(ctx.feature_layers))
@@ -765,7 +794,267 @@ class AdminBoundaryTest(unittest.TestCase):
         resources = None
 
         ctx = Context(feature_layers, nominal_zoom, unpadded_bounds, params,
-                      resources)
+                      resources, log=None)
 
         # the test is simply that an exception isn't thrown.
         admin_boundaries(ctx)
+
+
+class RoadNetworkFixTest(unittest.TestCase):
+
+    def test_normalize_br_netref(self):
+        from vectordatasource.transform import _normalize_br_netref
+        net, ref = _normalize_br_netref(None, "SP-1")
+        self.assertEqual("BR:SP", net)
+        self.assertEqual("SP-1", ref)
+
+    def test_guess_network_br(self):
+        from vectordatasource.transform import _guess_network_br
+        # should be empty for a missing ref
+        self.assertEqual([], _guess_network_br({}))
+        # should be empty for a blank ref
+        self.assertEqual([], _guess_network_br(dict(ref="")))
+
+
+# utility method to sort linestrings canonically, so that they can
+# be compared equal in a list. this allows us to use assertEqual on
+# multilinestrings where we don't care about the order of the lines
+# in the multi.
+def _sort_linestrings(lines):
+    return list(sorted(lines, key=lambda l: l.wkt))
+
+
+class MergeJunctionTest(unittest.TestCase):
+
+    def test_simple_merge(self):
+        from shapely.geometry import LineString, MultiLineString
+        from vectordatasource.transform import \
+            _merge_junctions_in_multilinestring
+
+        angle_tolerance = 15.0
+        mls = MultiLineString([
+            LineString([[0, 0], [1, 0]]),
+            LineString([[-1, 0], [0, 0]]),
+        ])
+
+        shape = _merge_junctions_in_multilinestring(mls, angle_tolerance)
+
+        expected = LineString([[-1, 0], [0, 0], [1, 0]])
+        self.assertEquals(shape, expected)
+
+    def test_four_way_merge(self):
+        from shapely.geometry import LineString, MultiLineString
+        from vectordatasource.transform import \
+            _merge_junctions_in_multilinestring
+
+        angle_tolerance = 15.0
+        mls = MultiLineString([
+            LineString([[0, 0], [1, 0]]),
+            LineString([[-1, 0], [0, 0]]),
+            LineString([[0, 0], [0, 1]]),
+            LineString([[0, 0], [0, -1]]),
+        ])
+
+        shape = _merge_junctions_in_multilinestring(mls, angle_tolerance)
+
+        expected = MultiLineString([
+            LineString([[-1, 0], [0, 0], [1, 0]]),
+            LineString([[0, -1], [0, 0], [0, 1]]),
+        ])
+
+        self.assertEquals(shape.geom_type, expected.geom_type)
+        self.assertEquals(_sort_linestrings(shape.geoms),
+                          _sort_linestrings(expected.geoms))
+
+    def test_merge_tolerance(self):
+        from shapely.geometry import LineString, MultiLineString
+        from vectordatasource.transform import \
+            _merge_junctions_in_multilinestring
+
+        angle_tolerance = 0.0
+        # these have been adjusted so that none of them meet at
+        # exact angles, so no merge should take place.
+        mls = MultiLineString([
+            LineString([[0, 0], [1, 0.1]]),
+            LineString([[-1, 0], [0, 0]]),
+            LineString([[0, 0], [0.1, 1]]),
+            LineString([[0, 0], [0, -1]]),
+        ])
+
+        shape = _merge_junctions_in_multilinestring(mls, angle_tolerance)
+
+        expected = mls
+        self.assertEquals(shape.geom_type, expected.geom_type)
+        self.assertEquals(_sort_linestrings(shape.geoms),
+                          _sort_linestrings(expected.geoms))
+
+    def test_partition_mls_nonoverlapping(self):
+        from shapely.geometry import LineString, MultiLineString
+        from vectordatasource.transform import \
+            _linestring_nonoverlapping_partition
+
+        # these are already non-overlapping, so should not be split
+        mls = MultiLineString([
+            LineString([[0, 0], [1, 0]]),
+            LineString([[0, 1], [1, 1]]),
+        ])
+
+        shapes = _linestring_nonoverlapping_partition(mls)
+
+        self.assertEquals(shapes, [mls])
+
+    def test_partition_mls_simple_overlapping(self):
+        from shapely.geometry import LineString, MultiLineString
+        from vectordatasource.transform import \
+            _linestring_nonoverlapping_partition
+
+        ls1 = LineString([[-1, 0], [1, 0]])
+        ls2 = LineString([[0, -1], [0, 1]])
+
+        # these are overlapping, so should be split
+        mls = MultiLineString([ls1, ls2])
+
+        shapes = _linestring_nonoverlapping_partition(mls)
+
+        self.assertEquals(shapes, [ls1, ls2])
+
+    def test_partition_mls_overlapping(self):
+        from shapely.geometry import LineString, MultiLineString
+        from vectordatasource.transform import \
+            _linestring_nonoverlapping_partition
+
+        ls1 = LineString([[-3, 0], [3, 0]])
+        ls2 = LineString([[0, -3], [0, 3]])
+        ls3 = LineString([[-3, 1], [3, 1]])
+        ls4 = LineString([[1, -3], [1, 3]])
+
+        # these are overlapping, so should be split
+        mls = MultiLineString([ls1, ls2, ls3, ls4])
+
+        shapes = _linestring_nonoverlapping_partition(mls)
+
+        self.assertEquals(shapes, [
+            MultiLineString([ls1, ls3]),
+            MultiLineString([ls2, ls4]),
+        ])
+
+
+class TestBoundingBoxIntersection(unittest.TestCase):
+
+    def _intersects(self, a, b):
+        from vectordatasource.transform import _intersects_bounds
+        self.assertTrue(_intersects_bounds(a, b))
+
+    def _disjoint(self, a, b):
+        from vectordatasource.transform import _intersects_bounds
+        self.assertFalse(_intersects_bounds(a, b))
+
+    def test_left(self):
+        self._disjoint((0, 0, 1, 1), (2, 0, 3, 1))
+
+    def test_right(self):
+        self._disjoint((2, 0, 3, 1), (0, 0, 1, 1))
+
+    def test_top(self):
+        self._disjoint((0, 0, 1, 1), (0, 2, 1, 3))
+
+    def test_bottom(self):
+        self._disjoint((0, 2, 1, 3), (0, 0, 1, 1))
+
+    def test_contains(self):
+        self._intersects((0, 0, 5, 5), (1, 1, 4, 4))
+
+    def tests_contained(self):
+        self._intersects((1, 1, 4, 4), (0, 0, 5, 5))
+
+    def test_half_left(self):
+        self._intersects((0, 0, 5, 2), (1, 1, 4, 3))
+
+    def test_half_top(self):
+        self._intersects((0, 0, 2, 5), (1, 1, 3, 4))
+
+
+class MergeBuildingTest(unittest.TestCase):
+
+    def test_merge_buildings(self):
+        from shapely.wkb import loads
+        from vectordatasource.transform import _merge_polygons_with_buffer
+
+        mp = loads(
+            '01060000000200000001030000000100000005000000295C8FC2F57A9040'
+            'E17A140E126B59410000000000A3904085EB51D8126B594148E17A14AEB9'
+            '9040C3F5285C0E6B5941666666666692904085EB51A80D6B5941295C8FC2'
+            'F57A9040E17A140E126B5941010300000001000000050000005C8FC2F528'
+            '439040713D0A070C6B5941666666666692904085EB51A80D6B5941333333'
+            '3333B99040EC51B84E066B594100000000006A9040B81E85AB046B59415C'
+            '8FC2F528439040713D0A070C6B5941'.decode('hex')
+        )
+        tolerance = 1.9109257071294063
+        result = _merge_polygons_with_buffer(mp, tolerance)
+
+        self.assertEquals(len(result), 1)
+        self.assertTrue(result[0].is_valid)
+
+
+class AngleAtTest(unittest.TestCase):
+
+    def _check(self, coords, angle):
+        from shapely.geometry import LineString
+        from vectordatasource.transform import _angle_at
+
+        ls = LineString(coords)
+        self.assertEqual(_angle_at(ls, ls.coords[0]), angle)
+        self.assertEqual(_angle_at(ls, ls.coords[-1]), angle)
+
+    def test_angle_at_zero(self):
+        self._check([[0, 0], [1, 0]], 0)
+
+    def test_angle_at_180(self):
+        self._check([[1, 0], [0, 0]], 0)
+
+    def test_angle_at_90(self):
+        self._check([[0, 0], [0, 1]], 90)
+
+    def test_angle_at_270(self):
+        self._check([[0, 1], [0, 0]], 90)
+
+    def test_angle_at_degenerate(self):
+        self._check([[0, 0], [0, 0]], None)
+
+
+class FirstPositiveIntegerNotInTest(unittest.TestCase):
+
+    def _check(self, value, expect):
+        from vectordatasource.transform import _first_positive_integer_not_in
+        self.assertEqual(_first_positive_integer_not_in(value), expect)
+
+    def test_empty(self):
+        self._check(set(), 1)
+
+    def test_one(self):
+        self._check(set([1]), 2)
+
+    def test_hole(self):
+        self._check(set([1, 3, 4]), 2)
+
+    def test_filled_hole(self):
+        self._check(set([1, 2, 3, 4]), 5)
+
+
+class BuildingHeightCalculation(unittest.TestCase):
+
+    def test_nonsense_height(self):
+        # test that a nonsensically large value for a height input
+        # doesn't get returned in the output.
+        from vectordatasource.transform import _building_calc_height
+        from vectordatasource.transform import _building_calc_levels
+        height = _building_calc_height('1e6', None, _building_calc_levels)
+        self.assertIsNone(height)
+
+    def test_nonsense_levels(self):
+        # test that a nonsensically large value for the number of levels in
+        # a building doesn't get into the output.
+        from vectordatasource.transform import _building_calc_height
+        from vectordatasource.transform import _building_calc_levels
+        height = _building_calc_height(None, '1000', _building_calc_levels)
+        self.assertIsNone(height)

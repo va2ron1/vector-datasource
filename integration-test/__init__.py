@@ -57,7 +57,7 @@ OVERPASS_SERVER = environ.get('OVERPASS_SERVER', 'overpass-api.de')
 # caching them for everyone to reuse.
 FIXTURE_CACHE = environ.get(
     'FIXTURE_CACHE',
-    'http://s3.amazonaws.com/mapzen-tiles-assets/integration-test-fixtures')
+    'http://s3.amazonaws.com/nextzen-tile-assets/integration-test-fixtures')
 
 
 def make_acceptable_module_name(path):
@@ -171,6 +171,11 @@ def match_distance(actual, expected):
             elif isinstance(exp_v, type):
                 if not isinstance(v, exp_v):
                     misses[exp_k] = "%r not an instance of %r" % (v, exp_v)
+                    distance += 1
+
+            elif callable(exp_v):
+                if not exp_v(v):
+                    misses[exp_k] = "%r(%r) is not truthy" % (exp_v, v)
                     distance += 1
 
             elif v != exp_v:
@@ -681,7 +686,9 @@ class FixtureShapeSource(object):
                         admin_level=2,
                     )
                 else:
-                    override_properties = dict(source="openstreetmapdata.com")
+                    override_properties = dict(
+                        source="osmdata.openstreetmap.de",
+                    )
                 _convert_shape_to_geojson(
                     shpfile, jsonfile, override_properties, clip, simplify)
                 jsonfiles.append(jsonfile)
@@ -734,6 +741,7 @@ class WOFSource(object):
                     'min_zoom': n.min_zoom,
                     'max_zoom': n.max_zoom,
                     'placetype': n.placetype,
+                    'wikidata': n.wikidata,
                 }
                 properties.update(n.l10n_names)
 
@@ -915,7 +923,7 @@ class FixtureEnvironment(object):
         label_placement_layers = {
             'point': set(['earth', 'water']),
             'polygon': set(['buildings', 'earth', 'landuse', 'water']),
-            'linestring': set(['earth', 'landuse', 'water']),
+            'linestring': set(['earth', 'landuse']),
         }
 
         self.layer_data = layer_data
@@ -1083,6 +1091,12 @@ class FixtureFeatureFetcher(object):
             yield tile_layers.keys()
         return inner(z, x, y)
 
+    def tile(self, z, x, y):
+        @contextmanager
+        def inner(z, x, y):
+            yield self._generate_tile(z, x, y)
+        return inner(z, x, y)
+
     def features_in_mvt_layer(self, z, x, y, layer):
         @contextmanager
         def inner(z, x, y, layer):
@@ -1194,6 +1208,18 @@ class Assertions(object):
                     "layer %r, but was supposed to find none. For example: "
                     "%r" % (properties, layer, feature['properties']))
 
+    def assert_n_matching_features(self, z, x, y, layer, properties, n):
+        with self.ff.features_in_tile_layer(z, x, y, layer) as features:
+            num_features, num_matching = count_matching(
+                features, properties)
+
+            if num_matching != n:
+                self.test.fail(
+                    "Found %d features matching properties %r in "
+                    "layer %r, but was supposed to find %d. "
+                    "Found %d total features." %
+                    (num_matching, properties, layer, n, num_features))
+
     def assert_feature_geom_type(self, z, x, y, layer, feature_id,
                                  exp_geom_type):
         with self.ff.features_in_tile_layer(z, x, y, layer) as features:
@@ -1242,8 +1268,11 @@ def expand_bbox(bounds, padding):
 
 class EmptyContext(object):
 
+    def __init__(self, factory=list):
+        self.factory = factory
+
     def __enter__(self):
-        return []
+        return self.factory()
 
     def __exit__(self, type, value, traceback):
         pass
@@ -1295,6 +1324,9 @@ class RunTestInstance(object):
     def assert_no_matching_feature(self, z, x, y, layer, props):
         self.assertions.assert_no_matching_feature(z, x, y, layer, props)
 
+    def assert_n_matching_features(self, z, x, y, layer, props, n):
+        self.assertions.assert_n_matching_features(z, x, y, layer, props, n)
+
     def assert_feature_geom_type(self, z, x, y, layer, feature_id,
                                  exp_geom_type):
         self.assertions.assert_feature_geom_type(
@@ -1309,6 +1341,9 @@ class RunTestInstance(object):
 
     def layers_in_tile(self, z, x, y):
         return self.assertions.ff.layers_in_tile(z, x, y)
+
+    def tile(self, z, x, y):
+        return self.assertions.ff.tile(z, x, y)
 
     def features_in_mvt_layer(self, z, x, y, layer):
         return self.assertions.ff.features_in_mvt_layer(z, x, y, layer)
@@ -1331,15 +1366,19 @@ class DownloadOnlyInstance(object):
 
     def load_fixtures(self, urls, clip, simplify):
         self.env.ensure_fixture_file(urls, clip, simplify)
+        raise unittest.SkipTest("download only instance doesn't run tests")
 
     def generate_fixtures(self, objs):
         # there is nothing to download for a generated fixture.
-        pass
+        raise unittest.SkipTest("download only instance doesn't run tests")
 
     def assert_has_feature(self, z, x, y, layer, props):
         pass
 
     def assert_no_matching_feature(self, z, x, y, layer, props):
+        pass
+
+    def assert_n_matching_features(self, z, x, y, layer, props, n):
         pass
 
     def assert_feature_geom_type(self, z, x, y, layer, feature_id,
@@ -1354,6 +1393,9 @@ class DownloadOnlyInstance(object):
 
     def layers_in_tile(self, z, x, y):
         return EmptyContext()
+
+    def tile(self, z, x, y):
+        return EmptyContext(dict)
 
     def features_in_mvt_layer(self, z, x, y, layer):
         return EmptyContext()
@@ -1388,6 +1430,9 @@ class CollectTilesInstance(object):
     def assert_no_matching_feature(self, z, x, y, layer, props):
         self._add_tile(z, x, y)
 
+    def assert_n_matching_features(self, z, x, y, layer, props, n):
+        self._add_tile(z, x, y)
+
     def assert_feature_geom_type(self, z, x, y, layer, feature_id,
                                  exp_geom_type):
         self._add_tile(z, x, y)
@@ -1402,6 +1447,10 @@ class CollectTilesInstance(object):
     def layers_in_tile(self, z, x, y):
         self._add_tile(z, x, y)
         return EmptyContext()
+
+    def tile(self, z, x, y):
+        self._add_tile(z, x, y)
+        return EmptyContext(dict)
 
     def features_in_mvt_layer(self, z, x, y, layer):
         self._add_tile(z, x, y)
@@ -1442,6 +1491,9 @@ class FixtureTest(unittest.TestCase):
     def assert_no_matching_feature(self, z, x, y, layer, props):
         self.test_instance.assert_no_matching_feature(z, x, y, layer, props)
 
+    def assert_n_matching_features(self, z, x, y, layer, props, n):
+        self.test_instance.assert_n_matching_features(z, x, y, layer, props, n)
+
     def assert_feature_geom_type(self, z, x, y, layer, feature_id,
                                  exp_geom_type):
         self.test_instance.assert_feature_geom_type(
@@ -1456,6 +1508,9 @@ class FixtureTest(unittest.TestCase):
 
     def layers_in_tile(self, z, x, y):
         return self.test_instance.layers_in_tile(z, x, y)
+
+    def tile(self, z, x, y):
+        return self.test_instance.tile(z, x, y)
 
     def features_in_mvt_layer(self, z, x, y, layer):
         return self.test_instance.features_in_mvt_layer(z, x, y, layer)

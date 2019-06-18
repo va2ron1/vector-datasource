@@ -9,9 +9,11 @@ LAYER_TABLES = {
     'boundaries': [
         'ne_10m_admin_0_boundary_lines_land',
         'ne_10m_admin_0_boundary_lines_map_units',
+        'ne_10m_admin_0_boundary_lines_disputed_areas',
         'ne_10m_admin_1_states_provinces_lines',
         'ne_110m_admin_0_boundary_lines_land',
         'ne_50m_admin_0_boundary_lines_land',
+        'ne_50m_admin_0_boundary_lines_disputed_areas',
         'ne_50m_admin_1_states_provinces_lines',
         'planet_osm_line',
         'planet_osm_polygon',
@@ -175,8 +177,11 @@ KNOWN_FUNCS = {
     'mz_calculate_ferry_level':           'mz_calculate_ferry_level',
     'util.is_building':                   'mz_calculate_is_building_or_part',
     'util.tag_str_to_bool':               'notimplemented',
-    'util.safe_int':                      'notimplemented',
+    'util.safe_int':                      'tz_safe_int',
     'util.true_or_none':                  'notimplemented',
+    'tz_looks_like_service_area':         'tz_looks_like_service_area',
+    'tz_looks_like_rest_area':            'tz_looks_like_rest_area',
+    'tz_estimate_parking_capacity':       'tz_estimate_parking_capacity',
 }
 
 
@@ -213,7 +218,7 @@ def sql_type(expr):
        isinstance(expr.func, ast.Attribute) and \
        isinstance(expr.func.value, ast.Name) and \
        expr.func.value.id == 'props' and \
-       expr.args[0].s == 'scalerank':
+       expr.args[0].s in ('scalerank', 'min_zoom'):
         return float
     return str
 

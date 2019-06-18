@@ -1,6 +1,7 @@
 -- correct the invalid data in the ne tables from reprojection
 UPDATE ne_10m_lakes SET the_geom=ST_MakeValid(the_geom) WHERE NOT ST_IsValid(the_geom);
 UPDATE ne_110m_land SET the_geom=ST_MakeValid(the_geom) WHERE NOT ST_IsValid(the_geom);
+UPDATE ne_10m_ocean SET the_geom=ST_MakeValid(the_geom) WHERE NOT ST_IsValid(the_geom);
 
 UPDATE ne_10m_admin_0_boundary_lines_land
   SET
@@ -17,6 +18,22 @@ UPDATE ne_10m_admin_0_boundary_lines_map_units
                      ELSE the_geom END)
   WHERE NOT ST_IsValid(the_geom);
 DELETE FROM ne_10m_admin_0_boundary_lines_map_units WHERE NOT ST_IsValid(the_geom);
+
+UPDATE ne_10m_admin_0_boundary_lines_disputed_areas
+  SET
+    the_geom = (CASE WHEN GeometryType(ST_MakeValid(the_geom)) = 'MULTILINESTRING'
+                          THEN ST_MakeValid(the_geom)
+                     ELSE the_geom END)
+  WHERE NOT ST_IsValid(the_geom);
+DELETE FROM ne_10m_admin_0_boundary_lines_disputed_areas WHERE NOT ST_IsValid(the_geom);
+
+UPDATE ne_50m_admin_0_boundary_lines_disputed_areas
+  SET
+    the_geom = (CASE WHEN GeometryType(ST_MakeValid(the_geom)) = 'MULTILINESTRING'
+                          THEN ST_MakeValid(the_geom)
+                     ELSE the_geom END)
+  WHERE NOT ST_IsValid(the_geom);
+DELETE FROM ne_50m_admin_0_boundary_lines_disputed_areas WHERE NOT ST_IsValid(the_geom);
 
 UPDATE ne_10m_admin_1_states_provinces_lines
   SET
@@ -98,6 +115,10 @@ UPDATE ne_50m_admin_0_boundary_lines_land
   SET mz_boundary_min_zoom = mz_calculate_min_zoom_boundaries(ne_50m_admin_0_boundary_lines_land.*)
   WHERE mz_calculate_min_zoom_boundaries(ne_50m_admin_0_boundary_lines_land.*) IS NOT NULL;
 
+UPDATE ne_50m_admin_0_boundary_lines_disputed_areas
+  SET mz_boundary_min_zoom = mz_calculate_min_zoom_boundaries(ne_50m_admin_0_boundary_lines_disputed_areas.*)
+  WHERE mz_calculate_min_zoom_boundaries(ne_50m_admin_0_boundary_lines_disputed_areas.*) IS NOT NULL;
+
 UPDATE ne_50m_admin_1_states_provinces_lines
   SET mz_boundary_min_zoom = mz_calculate_min_zoom_boundaries(ne_50m_admin_1_states_provinces_lines.*)
   WHERE mz_calculate_min_zoom_boundaries(ne_50m_admin_1_states_provinces_lines.*) IS NOT NULL;
@@ -109,6 +130,10 @@ UPDATE ne_10m_admin_0_boundary_lines_land
 UPDATE ne_10m_admin_0_boundary_lines_map_units
   SET mz_boundary_min_zoom = mz_calculate_min_zoom_boundaries(ne_10m_admin_0_boundary_lines_map_units.*)
   WHERE mz_calculate_min_zoom_boundaries(ne_10m_admin_0_boundary_lines_map_units.*) IS NOT NULL;
+
+UPDATE ne_10m_admin_0_boundary_lines_disputed_areas
+  SET mz_boundary_min_zoom = mz_calculate_min_zoom_boundaries(ne_10m_admin_0_boundary_lines_disputed_areas.*)
+  WHERE mz_calculate_min_zoom_boundaries(ne_10m_admin_0_boundary_lines_disputed_areas.*) IS NOT NULL;
 
 UPDATE ne_10m_admin_1_states_provinces_lines
   SET mz_boundary_min_zoom = mz_calculate_min_zoom_boundaries(ne_10m_admin_1_states_provinces_lines.*)
@@ -125,6 +150,10 @@ UPDATE ne_50m_urban_areas
 UPDATE ne_10m_urban_areas
   SET mz_landuse_min_zoom = mz_calculate_min_zoom_landuse(ne_10m_urban_areas.*)
   WHERE mz_calculate_min_zoom_landuse(ne_10m_urban_areas.*) IS NOT NULL;
+
+UPDATE ne_10m_roads
+  SET mz_road_min_zoom = mz_calculate_min_zoom_roads(ne_10m_roads.*)
+  WHERE mz_calculate_min_zoom_roads(ne_10m_roads.*) IS NOT NULL;
 
 UPDATE water_polygons SET mz_label_placement = ST_PointOnSurface(the_geom);
 UPDATE land_polygons SET mz_label_placement = ST_PointOnSurface(the_geom);
@@ -143,51 +172,17 @@ UPDATE ne_50m_urban_areas SET mz_label_placement = ST_PointOnSurface(the_geom);
 UPDATE ne_10m_urban_areas SET mz_label_placement = ST_PointOnSurface(the_geom);
 
 UPDATE ne_10m_urban_areas SET way_area=ST_Area(the_geom) WHERE the_geom IS NOT NULL;
-CREATE INDEX ne_10m_urban_areas_way_area_index ON ne_10m_urban_areas(way_area);
-
 UPDATE ne_50m_urban_areas SET way_area=ST_Area(the_geom) WHERE the_geom IS NOT NULL;
-CREATE INDEX ne_50m_urban_areas_way_area_index ON ne_50m_urban_areas(way_area);
-
 UPDATE ne_110m_ocean SET way_area=ST_Area(the_geom) WHERE the_geom IS NOT NULL;
-CREATE INDEX ne_110m_ocean_wayarea_index ON ne_110m_ocean(way_area);
-
 UPDATE ne_110m_lakes SET way_area=ST_Area(the_geom) WHERE the_geom IS NOT NULL;
-CREATE INDEX ne_110m_lakes_wayarea_index ON ne_110m_lakes(way_area);
-
 UPDATE ne_50m_ocean SET way_area=ST_Area(the_geom) WHERE the_geom IS NOT NULL;
-CREATE INDEX ne_50m_ocean_wayarea_index ON ne_50m_ocean(way_area);
-
 UPDATE ne_50m_lakes SET way_area=ST_Area(the_geom) WHERE the_geom IS NOT NULL;
-CREATE INDEX ne_50m_lakes_wayarea_index ON ne_50m_lakes(way_area);
-
 UPDATE ne_50m_playas SET way_area=ST_Area(the_geom) WHERE the_geom IS NOT NULL;
-CREATE INDEX ne_50m_playas_wayarea_index ON ne_50m_playas(way_area);
-
 UPDATE ne_10m_ocean SET way_area=ST_Area(the_geom) WHERE the_geom IS NOT NULL;
-CREATE INDEX ne_10m_ocean_wayarea_index ON ne_10m_ocean(way_area);
-
 UPDATE ne_10m_lakes SET way_area=ST_Area(the_geom) WHERE the_geom IS NOT NULL;
-CREATE INDEX ne_10m_lakes_wayarea_index ON ne_10m_lakes(way_area);
-
 UPDATE ne_10m_playas SET way_area=ST_Area(the_geom) WHERE the_geom IS NOT NULL;
-CREATE INDEX ne_10m_playas_wayarea_index ON ne_10m_playas(way_area);
-
 UPDATE water_polygons SET way_area=ST_Area(the_geom) WHERE the_geom IS NOT NULL;
-CREATE INDEX water_polygons_wayarea_index ON water_polygons(way_area);
-
 UPDATE ne_110m_land SET way_area=ST_Area(the_geom) WHERE the_geom IS NOT NULL;
-CREATE INDEX ne_110m_land_wayarea_index ON ne_110m_land(way_area);
-
 UPDATE ne_50m_land SET way_area=ST_Area(the_geom) WHERE the_geom IS NOT NULL;
-CREATE INDEX ne_50m_land_wayarea_index ON ne_50m_land(way_area);
-
 UPDATE ne_10m_land SET way_area=ST_Area(the_geom) WHERE the_geom IS NOT NULL;
-CREATE INDEX ne_10m_land_way_area_index ON ne_10m_land(way_area);
-
 UPDATE land_polygons SET way_area=ST_Area(the_geom) WHERE the_geom IS NOT NULL;
-CREATE INDEX land_polygons_wayarea_index ON land_polygons(way_area);
-
--- we look up min_label, max_label by wikidata ID.
-CREATE INDEX ne_10m_admin_0_countries_wikidata_index ON ne_10m_admin_0_countries(wikidataid);
-CREATE INDEX ne_10m_admin_0_map_units_wikidata_index ON ne_10m_admin_0_map_units(wikidataid);
-CREATE INDEX ne_10m_admin_1_states_provinces_wikidata_index ON ne_10m_admin_1_states_provinces(wikidataid);

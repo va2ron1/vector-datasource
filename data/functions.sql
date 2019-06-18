@@ -1029,3 +1029,117 @@ BEGIN
   );
 END
 $$ LANGUAGE plpgsql STABLE;
+
+-- return the min zoom for a node that looks like a service area.
+CREATE OR REPLACE FUNCTION tz_looks_like_service_area(name TEXT)
+RETURNS INTEGER AS $$
+BEGIN
+  IF name ILIKE '%service area' OR name ILIKE '%services' OR name ILIKE '%travel plaza' THEN
+    RETURN 13;
+  END IF;
+  RETURN 17;
+END;
+$$ LANGUAGE plpgsql IMMUTABLE;
+
+-- return the min zoom for a node that looks like a rest area.
+CREATE OR REPLACE FUNCTION tz_looks_like_rest_area(name TEXT)
+RETURNS INTEGER AS $$
+BEGIN
+  IF name ILIKE '%rest area' THEN
+    RETURN 13;
+  END IF;
+  RETURN 17;
+END;
+$$ LANGUAGE plpgsql IMMUTABLE;
+
+-- return the capacity of a parking lot, or estimate it from the area and building levels.
+CREATE OR REPLACE FUNCTION tz_estimate_parking_capacity(capacity TEXT, parking TEXT, levels TEXT, way_area REAL)
+RETURNS INTEGER AS $$
+DECLARE
+  levels_int INTEGER;
+  spaces_per_level INTEGER;
+BEGIN
+  -- if the capacity is set, then use that.
+  IF capacity ~ '^[0-9]+$' THEN
+    RETURN capacity::integer;
+  END IF;
+  -- otherwise, try to use the information we have to guess the capacity
+  spaces_per_level := (way_area / 46.0)::integer;
+  levels_int := CASE
+    WHEN levels ~ '^[0-9]+$' THEN levels::integer
+    WHEN parking = 'multi-storey' THEN 2
+    ELSE 1
+  END;
+  -- if we get a silly answer, don't set that - just return NULL to indicate
+  -- that we're unsure.
+  IF levels_int * spaces_per_level > 0 THEN
+    RETURN levels_int * spaces_per_level;
+  ELSE
+    RETURN NULL;
+  END IF;
+END;
+$$ LANGUAGE plpgsql IMMUTABLE;
+
+-- try to convert a string into an integer, returning null if that fails.
+CREATE OR REPLACE FUNCTION tz_safe_int(t text)
+RETURNS INTEGER AS $$
+DECLARE
+  val INTEGER DEFAULT NULL;
+BEGIN
+  BEGIN
+    val := (t)::INTEGER;
+  EXCEPTION WHEN OTHERS THEN
+    RETURN NULL;
+  END;
+  RETURN val;
+END;
+$$ LANGUAGE plpgsql IMMUTABLE;
+
+-- get extra wikidata properties matched to an OSM feature on the wikidata ID
+CREATE OR REPLACE FUNCTION extra_wikidata_properties(wikidata_id text)
+RETURNS JSONB AS $$
+DECLARE
+  tags HSTORE DEFAULT NULL;
+  ne_tags HSTORE DEFAULT NULL;
+BEGIN
+  IF wikidata_id IS NOT NULL THEN
+    SELECT w.tags INTO tags FROM wikidata w WHERE w.id = wikidata_id;
+    SELECT hstore(ARRAY[
+      'featurecla', ne_pp.featurecla,
+      'fclass_iso', ne_pp.fclass_iso,
+      'fclass_ar', ne_pp.fclass_ar,
+      'fclass_bd', ne_pp.fclass_bd,
+      'fclass_br', ne_pp.fclass_br,
+      'fclass_cn', ne_pp.fclass_cn,
+      'fclass_de', ne_pp.fclass_de,
+      'fclass_eg', ne_pp.fclass_eg,
+      'fclass_es', ne_pp.fclass_es,
+      'fclass_fr', ne_pp.fclass_fr,
+      'fclass_gb', ne_pp.fclass_gb,
+      'fclass_gr', ne_pp.fclass_gr,
+      'fclass_id', ne_pp.fclass_id,
+      'fclass_il', ne_pp.fclass_il,
+      'fclass_in', ne_pp.fclass_in,
+      'fclass_it', ne_pp.fclass_it,
+      'fclass_jp', ne_pp.fclass_jp,
+      'fclass_ko', ne_pp.fclass_ko,
+      'fclass_ma', ne_pp.fclass_ma,
+      'fclass_nl', ne_pp.fclass_nl,
+      'fclass_np', ne_pp.fclass_np,
+      'fclass_pk', ne_pp.fclass_pk,
+      'fclass_pl', ne_pp.fclass_pl,
+      'fclass_ps', ne_pp.fclass_ps,
+      'fclass_pt', ne_pp.fclass_pt,
+      'fclass_ru', ne_pp.fclass_ru,
+      'fclass_sa', ne_pp.fclass_sa,
+      'fclass_se', ne_pp.fclass_se,
+      'fclass_tr', ne_pp.fclass_tr,
+      'fclass_tw', ne_pp.fclass_tw,
+      'fclass_us', ne_pp.fclass_us,
+      'fclass_vn', ne_pp.fclass_vn
+    ]) INTO ne_tags FROM ne_10m_populated_places ne_pp
+    WHERE ne_pp.wikidataid = wikidata_id;
+  END IF;
+  RETURN to_jsonb(coalesce(tags, ''::hstore) || coalesce(ne_tags, ''::hstore));
+END;
+$$ LANGUAGE plpgsql STABLE;

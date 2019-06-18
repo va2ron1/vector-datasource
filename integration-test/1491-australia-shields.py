@@ -28,8 +28,8 @@ class AustraliaShieldTest(FixtureTest):
 
         self.assert_has_feature(
             z, x, y, 'roads',
-            {'id': 582052008, 'shield_text': '10', 'network': 'AU:A-road',
-             'all_networks': ['AU:A-road'], 'all_shield_texts': ['10']})
+            {'id': 582052008, 'shield_text': 'A10', 'network': 'AU:A-road',
+             'all_networks': ['AU:A-road'], 'all_shield_texts': ['A10']})
 
     def test_s_road_in_both_relations(self):
         import dsl
@@ -122,7 +122,7 @@ class AustraliaShieldTest(FixtureTest):
         self.assert_has_feature(
             z, x, y, 'roads', {
                 'id': 16477624, 'shield_text': '9', 'network': 'AU:T-drive',
-                'all_networks': ['AU:T-drive', type(None)],
+                'all_networks': ['AU:T-drive', 'AU'],
                 'all_shield_texts': ['9', '31'],
             })
 
@@ -188,9 +188,9 @@ class AustraliaShieldTest(FixtureTest):
 
         self.assert_has_feature(
             z, x, y, 'roads', {
-                'id': 131293316, 'shield_text': '62', 'network': 'AU:B-road',
+                'id': 131293316, 'shield_text': 'B62', 'network': 'AU:B-road',
                 'all_networks': ['AU:B-road', 'AU:T-drive', 'AU:T-drive'],
-                'all_shield_texts': ['62', '28', '30'],
+                'all_shield_texts': ['B62', '28', '30'],
             })
 
     def test_c_road(self):
@@ -223,8 +223,8 @@ class AustraliaShieldTest(FixtureTest):
 
         self.assert_has_feature(
             z, x, y, 'roads', {
-                'id': 7787334, 'shield_text': '475', 'network': 'AU:C-road',
-                'all_shield_texts': ['475', '476'],
+                'id': 7787334, 'shield_text': 'C475', 'network': 'AU:C-road',
+                'all_shield_texts': ['C475', 'C476'],
                 'all_networks': ['AU:C-road', 'AU:C-road'],
             })
 
@@ -234,8 +234,7 @@ class AustraliaShieldTest(FixtureTest):
     # https://en.wikipedia.org/wiki/Barndioota_Road
     #
     # so, given that this doesn't correspond to a known highway type in AU,
-    # we emit this with a network type of None, since we can't figure it out
-    # from the available information.
+    # we emit this with a network type of generic 'AU'.
     def test_d_road(self):
         import dsl
 
@@ -261,7 +260,7 @@ class AustraliaShieldTest(FixtureTest):
 
         self.assert_has_feature(
             z, x, y, 'roads', {
-                'id': 229978585, 'shield_text': '83', 'network': type(None),
+                'id': 229978585, 'shield_text': '83', 'network': 'AU',
             })
 
     def test_m_road(self):
@@ -291,7 +290,7 @@ class AustraliaShieldTest(FixtureTest):
 
         self.assert_has_feature(
             z, x, y, 'roads',
-            {'id': 3188239, 'shield_text': '1', 'network': 'AU:M-road'})
+            {'id': 3188239, 'shield_text': 'M1', 'network': 'AU:M-road'})
 
     # https://en.wikipedia.org/wiki/City_Ring_Route,_Adelaide
     def test_ring_route(self):

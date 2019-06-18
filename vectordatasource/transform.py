@@ -2,6 +2,7 @@
 # transformation functions to apply to features
 
 from collections import defaultdict, namedtuple
+from math import ceil
 from numbers import Number
 from shapely.geometry.collection import GeometryCollection
 from shapely.geometry import box as Box
@@ -57,7 +58,7 @@ digits_pattern = re.compile('^[0-9-]+$')
 
 # used to detect station names which are followed by a
 # parenthetical list of line names.
-station_pattern = re.compile('([^(]*)\(([^)]*)\).*')
+station_pattern = re.compile(r'([^(]*)\(([^)]*)\).*')
 
 # used to detect if an airport's IATA code is the "short"
 # 3-character type. there are also longer codes, and ones
@@ -131,6 +132,54 @@ def _remove_properties(properties, *property_names):
     return properties
 
 
+def _is_name(key):
+    """
+    Return True if this key looks like a name.
+
+    This isn't as simple as testing if key == 'name', as there are alternative
+    name-like tags such as 'official_name', translated names such as 'name:en',
+    and left/right names for boundaries. This function aims to match all of
+    those variants.
+    """
+
+    # simplest and most common case first
+    if key == 'name':
+        return True
+
+    # translations next
+    if key.startswith('name:'):
+        return True
+
+    # then any of the alternative forms of name
+    return any(key.startswith(p) for p in tag_name_alternates)
+
+
+def _remove_names(props):
+    """
+    Remove entries in the props dict for which the key looks like a name.
+
+    Modifies the props dict in-place and also returns it.
+    """
+
+    for k in props.keys():
+        if _is_name(k):
+            props.pop(k)
+
+    return props
+
+
+def _has_name(props):
+    """
+    Return true if any of the props look like a name.
+    """
+
+    for k in props.keys():
+        if _is_name(k):
+            return True
+
+    return False
+
+
 def _building_calc_levels(levels):
     levels = max(levels, 1)
     levels = (levels * 3) + 2
@@ -143,15 +192,24 @@ def _building_calc_min_levels(min_levels):
     return min_levels
 
 
+# slightly bigger than the tallest structure in the world. at the time
+# of writing, the Burj Khalifa at 829.8m. this is used as a check to make
+# sure that nonsense values (e.g: buildings a million meters tall) don't
+# make it into the data.
+TALLEST_STRUCTURE_METERS = 1000.0
+
+
 def _building_calc_height(height_val, levels_val, levels_calc_fn):
     height = _to_float_meters(height_val)
-    if height is not None:
+    if height is not None and 0 <= height <= TALLEST_STRUCTURE_METERS:
         return height
     levels = _to_float_meters(levels_val)
     if levels is None:
         return None
     levels = levels_calc_fn(levels)
-    return levels
+    if 0 <= levels <= TALLEST_STRUCTURE_METERS:
+        return levels
+    return None
 
 
 def add_id_to_properties(shape, properties, fid, zoom):
@@ -229,7 +287,7 @@ def road_classifier(shape, properties, fid, zoom):
         properties['is_link'] = True
     if tunnel in ('yes', 'true'):
         properties['is_tunnel'] = True
-    if bridge in ('yes', 'true'):
+    if bridge and bridge != 'no':
         properties['is_bridge'] = True
 
     return shape, properties, fid
@@ -324,6 +382,39 @@ def place_population_int(shape, properties, fid, zoom):
     if population is not None:
         properties['population'] = int(population)
     return shape, properties, fid
+
+
+def population_rank(shape, properties, fid, zoom):
+    population = properties.get('population')
+    pop_breaks = [
+        1000000000,
+        100000000,
+        50000000,
+        20000000,
+        10000000,
+        5000000,
+        1000000,
+        500000,
+        200000,
+        100000,
+        50000,
+        20000,
+        10000,
+        5000,
+        2000,
+        1000,
+        200,
+        0,
+    ]
+    for i, pop_break in enumerate(pop_breaks):
+        if population >= pop_break:
+            rank = len(pop_breaks) - i
+            break
+    else:
+        rank = 0
+
+    properties['population_rank'] = rank
+    return (shape, properties, fid)
 
 
 def pois_capacity_int(shape, properties, fid, zoom):
@@ -1000,13 +1091,16 @@ def _find_layer(feature_layers, name):
     return None
 
 
-# shared implementation of the intercut algorithm, used
-# both when cutting shapes and using overlap to determine
-# inside / outsideness.
-def _intercut_impl(intersect_func, feature_layers,
-                   base_layer, cutting_layer, attribute,
-                   target_attribute, cutting_attrs,
-                   keep_geom_type):
+# shared implementation of the intercut algorithm, used both when cutting
+# shapes and using overlap to determine inside / outsideness.
+#
+# the filter_fn are used to filter which features from the base layer are cut
+# with which features from the cutting layer. cutting layer features which do
+# not match the filter are ignored, base layer features are left in the layer
+# unchanged.
+def _intercut_impl(intersect_func, feature_layers, base_layer, cutting_layer,
+                   attribute, target_attribute, cutting_attrs, keep_geom_type,
+                   cutting_filter_fn=None, base_filter_fn=None):
     # the target attribute can default to the attribute if
     # they are distinct. but often they aren't, and that's
     # why target_attribute is a separate parameter.
@@ -1034,21 +1128,54 @@ def _intercut_impl(intersect_func, feature_layers,
     base_features = base['features']
     cutting_features = cutting['features']
 
+    # filter out any features that we don't want to cut with
+    if cutting_filter_fn is not None:
+        cutting_features = filter(cutting_filter_fn, cutting_features)
+
+    # short-cut return if there are no cutting features => there's nothing
+    # to do.
+    if not cutting_features:
+        return base
+
     # make a cutter object to help out
     cutter = _Cutter(cutting_features, cutting_attrs,
                      attribute, target_attribute,
                      keep_geom_type, intersect_func)
 
+    skipped_features = []
     for base_feature in base_features:
-        # we use shape to track the current remainder of the
-        # shape after subtracting bits which are inside cuts.
-        shape, props, fid = base_feature
+        if base_filter_fn is None or base_filter_fn(base_feature):
+            # we use shape to track the current remainder of the
+            # shape after subtracting bits which are inside cuts.
+            shape, props, fid = base_feature
 
-        cutter.cut(shape, props, fid)
+            cutter.cut(shape, props, fid)
 
-    base['features'] = cutter.new_features
+        else:
+            skipped_features.append(base_feature)
+
+    base['features'] = cutter.new_features + skipped_features
 
     return base
+
+
+class Where(object):
+    """
+    A "where" clause for filtering features based on their properties.
+
+    This is commonly used in post-processing steps to configure which features
+    in the layer we want to operate on, allowing us to write simple Python
+    expressions in the YAML.
+    """
+
+    def __init__(self, where):
+        self.fn = compile(where, 'queries.yaml', 'eval')
+
+    def __call__(self, feature):
+        shape, props, fid = feature
+        local = defaultdict(lambda: None)
+        local.update(props)
+        return eval(self.fn, {}, local)
 
 
 # intercut takes features from a base layer and cuts each
@@ -1083,6 +1210,14 @@ def _intercut_impl(intersect_func, feature_layers,
 # - keep_geom_type: if truthy, then filter the output to be
 #     the same type as the input. defaults to True, because
 #     this seems like an eminently sensible behaviour.
+# - base_where: if truthy, a Python expression which is
+#     evaluated in the context of a feature's properties and
+#     can return True if the feature is to be cut and False
+#     if it should be passed through unmodified.
+# - cutting_where: if truthy, a Python expression which is
+#     evaluated in the context of a feature's properties and
+#     can return True if the feature is to be used for cutting
+#     and False if it should be ignored.
 #
 # returns a feature layer which is the base layer cut by the
 # cutting layer.
@@ -1107,10 +1242,19 @@ def intercut(ctx):
     target_attribute = ctx.params.get('target_attribute')
     cutting_attrs = ctx.params.get('cutting_attrs')
     keep_geom_type = ctx.params.get('keep_geom_type', True)
+    base_where = ctx.params.get('base_where')
+    cutting_where = ctx.params.get('cutting_where')
+
+    # compile the where-clauses, if any were configured
+    if base_where:
+        base_where = Where(base_where)
+    if cutting_where:
+        cutting_where = Where(cutting_where)
 
     return _intercut_impl(
         _intersect_cut, feature_layers, base_layer, cutting_layer,
-        attribute, target_attribute, cutting_attrs, keep_geom_type)
+        attribute, target_attribute, cutting_attrs, keep_geom_type,
+        base_filter_fn=base_where, cutting_filter_fn=cutting_where)
 
 
 # overlap measures the area overlap between each feature in
@@ -1150,6 +1294,8 @@ def overlap(ctx):
     cutting_attrs = ctx.params.get('cutting_attrs')
     keep_geom_type = ctx.params.get('keep_geom_type', True)
     min_fraction = ctx.params.get('min_fraction', 0.8)
+    base_where = ctx.params.get('base_where')
+    cutting_where = ctx.params.get('cutting_where')
 
     # use a different function for linear overlaps (i.e: roads with polygons)
     # than area overlaps. keeping this explicit (rather than relying on the
@@ -1161,10 +1307,17 @@ def overlap(ctx):
     else:
         overlap_fn = _intersect_overlap(min_fraction)
 
+    # compile the where-clauses, if any were configured
+    if base_where:
+        base_where = Where(base_where)
+    if cutting_where:
+        cutting_where = Where(cutting_where)
+
     return _intercut_impl(
         overlap_fn, feature_layers, base_layer,
         cutting_layer, attribute, target_attribute, cutting_attrs,
-        keep_geom_type)
+        keep_geom_type, cutting_filter_fn=cutting_where,
+        base_filter_fn=base_where)
 
 
 # intracut cuts a layer with a set of features from that same
@@ -1803,6 +1956,26 @@ def _orient(geom):
     return geom
 
 
+def _fix_disputed_left_right_kinds(props):
+    """
+    After merging left/right props, we might find that any kind:XX for disputed
+    borders are mixed up as kind:left:XX or kind:right:XX and we want to merge
+    them back together again.
+    """
+
+    keys = []
+    for k in props.keys():
+        if k.startswith('kind:left:') or k.startswith('kind:right:'):
+            keys.append(k)
+
+    for k in keys:
+        prefix = 'kind:left:' if k.startswith('kind:left:') else 'kind:right:'
+        new_key = 'kind:' + k[len(prefix):]
+
+        value = props.pop(k)
+        props[new_key] = value
+
+
 def admin_boundaries(ctx):
     """
     Given a layer with admin boundaries and inclusion polygons for
@@ -1924,6 +2097,7 @@ def admin_boundaries(ctx):
                         new_props = _merge_left_right_props(props, cut_props)
                         new_props['id'] = props['id']
                         _make_joined_name(new_props)
+                        _fix_disputed_left_right_kinds(new_props)
                         new_features.append((inside, new_props, fid))
 
                 if boundary.is_empty:
@@ -1957,6 +2131,101 @@ def admin_boundaries(ctx):
 
     layer['features'] = cutter.new_features
     return layer
+
+
+def _unicode_len(s):
+    if isinstance(s, str):
+        return len(s.decode('utf-8'))
+    elif isinstance(s, unicode):
+        return len(s)
+    return None
+
+
+def _delete_labels_longer_than(max_label_chars, props):
+    """
+    Delete entries in the props dict where the key starts with 'name' and the
+    unicode length of the value is greater than max_label_chars.
+
+    If one half of a left/right pair is too long, then the opposite in the pair
+    is also deleted.
+    """
+
+    to_delete = set()
+
+    for k, v in props.iteritems():
+        if not k.startswith('name'):
+            continue
+
+        length_chars = _unicode_len(v)
+        if length_chars is None:
+            # huh? name isn't a string?
+            continue
+
+        if length_chars <= max_label_chars:
+            continue
+
+        to_delete.add(k)
+        if k.startswith('name:left:'):
+            opposite_k = k.replace(':left:', ':right:')
+            to_delete.add(opposite_k)
+        elif k.startswith('name:right:'):
+            opposite_k = k.replace(':right:', ':left:')
+            to_delete.add(opposite_k)
+
+    for k in to_delete:
+        if k in props:
+            del props[k]
+
+
+def drop_names_on_short_boundaries(ctx):
+    """
+    Drop all names on a boundaries which are too small to render the shortest
+    name.
+    """
+
+    params = _Params(ctx, 'drop_names_on_short_boundaries')
+    layer_name = params.required('source_layer')
+    start_zoom = params.optional('start_zoom', typ=int, default=0)
+    end_zoom = params.optional('end_zoom', typ=int)
+    pixels_per_letter = params.optional('pixels_per_letter', typ=(int, float),
+                                        default=10.0)
+
+    layer = _find_layer(ctx.feature_layers, layer_name)
+    zoom = ctx.nominal_zoom
+
+    if zoom < start_zoom or \
+       (end_zoom is not None and zoom >= end_zoom):
+        return None
+
+    # tolerance for zoom gives us a value in meters for a pixel, so it's
+    # meters per pixel
+    meters_per_letter = pixels_per_letter * tolerance_for_zoom(zoom)
+
+    for shape, props, fid in layer['features']:
+        geom_type = shape.geom_type
+
+        if geom_type in ('LineString', 'MultiLineString'):
+            # simplify to one letter size. this gets close to what might
+            # practically be renderable, and means we're not counting any
+            # sub-letter scale fractal crinklyness towards the length of
+            # the line.
+            label_shape = shape.simplify(meters_per_letter)
+
+            if geom_type == 'LineString':
+                shape_length_meters = label_shape.length
+            else:
+                # get the longest section to see if that's labellable - if
+                # not, then none of the sections could have a label and we
+                # can drop the names.
+                shape_length_meters = max(part.length for part in label_shape)
+
+            # maximum number of characters we'll be able to print at this
+            # zoom.
+            max_label_chars = int(shape_length_meters / meters_per_letter)
+
+            _delete_labels_longer_than(max_label_chars, props)
+
+    return None
 
 
 def handle_label_placement(ctx):
@@ -2131,10 +2400,13 @@ def drop_features_where(ctx):
     source_layer = ctx.params.get('source_layer')
     assert source_layer, 'drop_features_where: missing source layer'
     start_zoom = ctx.params.get('start_zoom', 0)
+    end_zoom = ctx.params.get('end_zoom')
     where = ctx.params.get('where')
     assert where, 'drop_features_where: missing where'
 
     if zoom < start_zoom:
+        return None
+    if end_zoom is not None and zoom >= end_zoom:
         return None
 
     layer = _find_layer(feature_layers, source_layer)
@@ -2149,6 +2421,7 @@ def drop_features_where(ctx):
 
         local = properties.copy()
         local['properties'] = properties
+        local['geom_type'] = shape.geom_type
 
         if not eval(where, {}, local):
             new_features.append(feature)
@@ -2196,9 +2469,12 @@ def _project_properties(ctx, action):
             new_features.append((shape, props, fid))
             continue
 
-        # copy params to add a 'zoom' one. would prefer '$zoom', but apparently
-        # that's not allowed in python syntax.
-        local = props.copy()
+        # we're going to use a defaultdict for this, so that references to
+        # properties which don't exist just end up as None without causing an
+        # exception. we also add a 'zoom' one. would prefer '$zoom', but
+        # apparently that's not allowed in python syntax.
+        local = defaultdict(lambda: None)
+        local.update(props)
         local['zoom'] = zoom
 
         # allow decisions based on meters per pixel zoom too.
@@ -2220,10 +2496,24 @@ def drop_properties(ctx):
     """
 
     properties = ctx.params.get('properties')
+    all_name_variants = ctx.params.get('all_name_variants', False)
     assert properties, 'drop_properties: missing properties'
 
     def action(p):
+        if all_name_variants and 'name' in properties:
+            p = _remove_names(p)
         return _remove_properties(p, *properties)
+
+    return _project_properties(ctx, action)
+
+
+def drop_names(ctx):
+    """
+    Drop all names on properties for features in this layer.
+    """
+
+    def action(p):
+        return _remove_names(p)
 
     return _project_properties(ctx, action)
 
@@ -2956,6 +3246,11 @@ def _thaw(thing):
 
 
 def quantize_val(val, step):
+    # special case: if val is very small, we don't want it rounding to zero, so
+    # round the smallest values up to the first step.
+    if val < step:
+        return int(step)
+
     result = int(step * round(val / float(step)))
     return result
 
@@ -2968,35 +3263,347 @@ def quantize_height_round_nearest_10_meters(height):
     return quantize_val(height, 10)
 
 
+def quantize_height_round_nearest_20_meters(height):
+    return quantize_val(height, 20)
+
+
 def quantize_height_round_nearest_meter(height):
     return round(height)
 
 
-def _merge_lines(linestring_shapes):
+def _merge_lines(linestring_shapes, _unused_tolerance):
     list_of_linestrings = []
     for shape in linestring_shapes:
         list_of_linestrings.extend(_flatten_geoms(shape))
+
+    # if the list of linestrings is empty, return None. this avoids generating
+    # an empty GeometryCollection, which causes problems further down the line,
+    # usually while formatting the tile.
+    if not list_of_linestrings:
+        return []
+
     multi = MultiLineString(list_of_linestrings)
     result = _linemerge(multi)
-    return result
+    return [result]
 
 
-def _merge_polygons(polygon_shapes):
+def _drop_small_inners_multi(shape, area_tolerance):
+    """
+    Drop inner rings (holes) of the given shape which are smaller than the area
+    tolerance. The shape must be either a Polygon or MultiPolygon. Returns a
+    shape which may be empty.
+    """
+
+    from shapely.geometry import MultiPolygon
+
+    if shape.geom_type == 'Polygon':
+        shape = _drop_small_inners(shape, area_tolerance)
+
+    elif shape.geom_type == 'MultiPolygon':
+        multi = []
+        for poly in shape:
+            new_poly = _drop_small_inners(poly, area_tolerance)
+            if not new_poly.is_empty:
+                multi.append(new_poly)
+        shape = MultiPolygon(multi)
+
+    else:
+        shape = MultiPolygon([])
+
+    return shape
+
+
+def _drop_small_outers_multi(shape, area_tolerance):
+    """
+    Drop individual polygons which are smaller than the area tolerance. Input
+    can be a single Polygon or MultiPolygon, in which case each Polygon within
+    the MultiPolygon will be compared to the area tolerance individually.
+
+    Returns a shape, which may be empty.
+    """
+
+    from shapely.geometry import MultiPolygon
+
+    if shape.geom_type == 'Polygon':
+        if shape.area < area_tolerance:
+            shape = MultiPolygon([])
+
+    elif shape.geom_type == 'MultiPolygon':
+        multi = []
+        for poly in shape:
+            if poly.area >= area_tolerance:
+                multi.append(poly)
+        shape = MultiPolygon(multi)
+
+    else:
+        shape = MultiPolygon([])
+
+    return shape
+
+
+def _merge_polygons(polygon_shapes, tolerance):
+    """
+    Merge a list of polygons together into a single shape. Returns list of
+    shapes, which might be empty.
+    """
+
     list_of_polys = []
     for shape in polygon_shapes:
         list_of_polys.extend(_flatten_geoms(shape))
-    result = shapely.ops.unary_union(list_of_polys)
-    return result
+
+    # if the list of polygons is empty, return None. this avoids generating an
+    # empty GeometryCollection, which causes problems further down the line,
+    # usually while formatting the tile.
+    if not list_of_polys:
+        return []
+
+    # first, try to merge the polygons as they are.
+    try:
+        result = shapely.ops.unary_union(list_of_polys)
+        return [result]
+
+    except ValueError:
+        pass
+
+    # however, this can lead to numerical instability where polygons _almost_
+    # touch, so sometimes buffering them outwards a little bit can help.
+    try:
+        from shapely.geometry import JOIN_STYLE
+
+        # don't buffer by the full pixel, instead choose a smaller value that
+        # shouldn't be noticable.
+        buffer_size = tolerance / 16.0
+
+        list_of_buffered = [
+            p.buffer(buffer_size, join_style=JOIN_STYLE.mitre, mitre_limit=1.5)
+            for p in list_of_polys
+        ]
+        result = shapely.ops.unary_union(list_of_buffered)
+        return [result]
+
+    except ValueError:
+        pass
+
+    # ultimately, if it's not possible to merge them then bail.
+    # TODO: when we get a logger in here, let's log a big FAIL message.
+    return []
+
+
+def _merge_polygons_with_buffer(polygon_shapes, tolerance):
+    """
+    Merges polygons together with a buffer operation to blend together
+    adjacent polygons. Originally designed for buildings.
+
+    It does this by first merging the polygons into a single MultiPolygon and
+    then dilating or buffering the polygons by a small amount (tolerance). The
+    shape is then simplified, small inners are dropped and it is shrunk back
+    by the same amount it was dilated by. Finally, small polygons are dropped.
+
+    Many cities around the world have dense buildings in blocks, but these
+    buildings can be quite detailed; having complex facades or interior
+    courtyards or lightwells. As we zoom out, we often would like to keep the
+    "visual texture" of the buildings, but reducing the level of detail
+    significantly. This method aims to get closer to that, merging neighbouring
+    buildings together into blocks.
+    """
+
+    from shapely.geometry import JOIN_STYLE
+
+    area_tolerance = tolerance * tolerance
+    # small factor, relative to tolerance. this is used so that we don't buffer
+    # polygons out by exactly the same amount as we buffer them inwards. using
+    # the exact same value ends up causing topology problems when two points on
+    # opposing sides of the polygon meet eachother exactly.
+    epsilon = tolerance * 1.0e-6
+
+    result = _merge_polygons(polygon_shapes, tolerance)
+    if not result:
+        return result
+
+    assert len(result) == 1
+    result = result[0]
+
+    # buffer with a mitre join, as this keeps the corners sharp and (mostly)
+    # keeps angles the same. to avoid spikes, we limit the mitre to a little
+    # under 90 degrees.
+    result = result.buffer(
+        tolerance - epsilon, join_style=JOIN_STYLE.mitre, mitre_limit=1.5)
+    result = result.simplify(tolerance)
+    result = _drop_small_inners_multi(result, area_tolerance)
+    result = result.buffer(
+        -tolerance, join_style=JOIN_STYLE.mitre, mitre_limit=1.5)
+    result = _drop_small_outers_multi(result, area_tolerance)
+
+    # don't return invalid results!
+    if result.is_empty or not result.is_valid:
+        return []
+
+    return [result]
+
+
+def _union_bounds(a, b):
+    """
+    Union two (minx, miny, maxx, maxy) tuples of bounds, returning a tuple
+    which covers both inputs.
+    """
+
+    if a is None:
+        return b
+    elif b is None:
+        return a
+    else:
+        aminx, aminy, amaxx, amaxy = a
+        bminx, bminy, bmaxx, bmaxy = b
+        return (min(aminx, bminx), min(aminy, bminy),
+                max(amaxx, bmaxx), max(amaxy, bmaxy))
+
+
+def _intersects_bounds(a, b):
+    """
+    Return true if two bounding boxes intersect.
+    """
+
+    aminx, aminy, amaxx, amaxy = a
+    bminx, bminy, bmaxx, bmaxy = b
+
+    if aminx > bmaxx or amaxx < bminx:
+        return False
+
+    elif aminy > bmaxy or amaxy < bminy:
+        return False
+
+    return True
+
+
+# RecursiveMerger is a set of functions to merge geometry recursively in a
+# quad tree.
+#
+# It consists of three functions, any of which can be `id` for a no-op, and
+# all of which take a single argument which will be a list of shapes, and
+# should return a list of shapes as output.
+#
+#   * leaf: called at the leaves of the quad tree with original geometry.
+#   * node: called at internal nodes of the quad tree with the results of
+#           either calls to leaf() or node().
+#   * root: called once at the root with the results of the top node (or leaf
+#           if it's a degenerate single-level tree).
+#   * tolerance: a length that is approximately a pixel, or the size by which
+#                things can be simplified or snapped to.
+#
+# These allow us to merge transformed versions of geometry, where leaf()
+# transforms the geometry to some other form (e.g: buffered for buildings),
+# node merges those recursively, and then root reverses the buffering.
+#
+RecursiveMerger = namedtuple('RecursiveMerger', 'leaf node root tolerance')
+
+
+# A bucket used to sort shapes into the next level of the quad tree.
+Bucket = namedtuple("Bucket", "bounds box shapes")
+
+
+def _mkbucket(*bounds):
+    """
+    Convenience method to make a bucket from a tuple of bounds (minx, miny,
+    maxx, maxy) and also make the Shapely shape for that.
+    """
+
+    from shapely.geometry import box
+
+    return Bucket(bounds, box(*bounds), [])
+
+
+def _merge_shapes_recursively(shapes, shapes_per_merge, merger, depth=0,
+                              bounds=None):
+    """
+    Group the shapes geographically, returning a list of shapes. The merger,
+    which must be a RecursiveMerger, controls how the shapes are merged.
+
+    This is to help merging/unioning, where it's better to try and merge shapes
+    which are adjacent or near each other, rather than just taking a slice of
+    a list of shapes which might be in any order.
+
+    The shapes_per_merge controls at what depth the tree starts merging.
+    Smaller values mean a deeper tree, which might increase performance if
+    merging large numbers of items at once is slow.
+
+    This method is recursive, and will bottom out after 5 levels deep, which
+    might mean that sometimes more than shapes_per_merge items are merged at
+    once.
+    """
+
+    assert isinstance(merger, RecursiveMerger)
+
+    # don't keep recursing. if we haven't been able to get to a smaller number
+    # of shapes by 5 levels down, then perhaps there are particularly large
+    # shapes which are preventing things getting split up correctly.
+    if len(shapes) <= shapes_per_merge and depth == 0:
+        return merger.root(merger.leaf(shapes, merger.tolerance))
+    elif depth >= 5:
+        return merger.leaf(shapes, merger.tolerance)
+
+    # on the first call, figure out what the bounds of the shapes are. when
+    # recursing, use the bounds passed in from the parent.
+    if bounds is None:
+        for shape in shapes:
+            bounds = _union_bounds(bounds, shape.bounds)
+
+    minx, miny, maxx, maxy = bounds
+    midx = 0.5 * (minx + maxx)
+    midy = 0.5 * (miny + maxy)
+
+    # find the 4 quadrants of the bounding box and use those to bucket the
+    # shapes so that neighbouring shapes are more likely to stay together.
+    buckets = [
+        _mkbucket(minx, miny, midx, midy),
+        _mkbucket(minx, midy, midx, maxy),
+        _mkbucket(midx, miny, maxx, midy),
+        _mkbucket(midx, midy, maxx, maxy),
+    ]
+
+    for shape in shapes:
+        for bucket in buckets:
+            if shape.intersects(bucket.box):
+                bucket.shapes.append(shape)
+                break
+        else:
+            raise AssertionError(
+                "Expected shape %r to intersect at least one quadrant, but "
+                "intersects none." % (shape.wkt))
+
+    # recurse if necessary to get below the number of shapes per merge that
+    # we want.
+    grouped_shapes = []
+    for bucket in buckets:
+        if len(bucket.shapes) > shapes_per_merge:
+            recursed = _merge_shapes_recursively(
+                bucket.shapes, shapes_per_merge, merger,
+                depth=depth+1, bounds=bucket.bounds)
+            grouped_shapes.extend(recursed)
+
+        # don't add empty lists!
+        elif bucket.shapes:
+            grouped_shapes.extend(merger.leaf(bucket.shapes, merger.tolerance))
+
+    fn = merger.root if depth == 0 else merger.node
+    return fn(grouped_shapes)
+
+
+def _noop(x):
+    return x
 
 
 def _merge_features_by_property(
-        features, geom_dim,
+        features, geom_dim, tolerance,
         update_props_pre_fn=None,
         update_props_post_fn=None,
-        max_merged_features=None):
+        max_merged_features=None,
+        merge_shape_fn=None,
+        merge_props_fn=None):
 
     assert geom_dim in (_POLYGON_DIMENSION, _LINE_DIMENSION)
-    if geom_dim == _LINE_DIMENSION:
+    if merge_shape_fn is not None:
+        _merge_shape_fn = merge_shape_fn
+    elif geom_dim == _LINE_DIMENSION:
         _merge_shape_fn = _merge_lines
     else:
         _merge_shape_fn = _merge_polygons
@@ -3021,10 +3628,12 @@ def _merge_features_by_property(
 
         frozen_props = _freeze(props)
         if frozen_props in features_by_property:
-            features_by_property[frozen_props][-1].append(shape)
+            record = features_by_property[frozen_props]
+            record[-1].append(shape)
+            record[-2].append(orig_props)
         else:
             features_by_property[frozen_props] = (
-                (fid, p_id, orig_props, [shape]))
+                (fid, p_id, [orig_props], [shape]))
 
     new_features = []
     for frozen_props, (fid, p_id, orig_props, shapes) in \
@@ -3032,7 +3641,7 @@ def _merge_features_by_property(
 
         if len(shapes) == 1:
             # restore original properties if we only have a single shape
-            new_features.append((shapes[0], orig_props, fid))
+            new_features.append((shapes[0], orig_props[0], fid))
             continue
 
         num_shapes = len(shapes)
@@ -3043,12 +3652,21 @@ def _merge_features_by_property(
             # them all to have duplicate IDs.
             fid = None
 
-        for i in range(0, num_shapes, shapes_per_merge):
-            j = min(num_shapes, i + shapes_per_merge)
-            merged_shape = _merge_shape_fn(shapes[i:j])
+        merger = RecursiveMerger(root=_noop, node=_noop, leaf=_merge_shape_fn,
+                                 tolerance=tolerance)
 
-            # thaw the frozen properties to use in the new feature.
-            props = _thaw(frozen_props)
+        for merged_shape in _merge_shapes_recursively(
+                shapes, shapes_per_merge, merger):
+            # don't keep any features which have become degenerate or empty
+            # after having been merged.
+            if merged_shape is None or merged_shape.is_empty:
+                continue
+
+            if merge_props_fn is None:
+                # thaw the frozen properties to use in the new feature.
+                props = _thaw(frozen_props)
+            else:
+                props = merge_props_fn(orig_props)
 
             if update_props_post_fn:
                 props = update_props_post_fn((merged_shape, props, fid))
@@ -3057,6 +3675,42 @@ def _merge_features_by_property(
 
     new_features.extend(skipped_features)
     return new_features
+
+
+def quantize_height(ctx):
+    """
+    Quantize the height property of features in the layer according to the
+    per-zoom configured quantize function.
+    """
+
+    params = _Params(ctx, 'quantize_height')
+    zoom = ctx.nominal_zoom
+    source_layer = params.required('source_layer')
+    start_zoom = params.optional('start_zoom', default=0, typ=int)
+    end_zoom = params.optional('end_zoom', typ=int)
+    quantize_cfg = params.required('quantize', typ=dict)
+
+    layer = _find_layer(ctx.feature_layers, source_layer)
+    if layer is None:
+        return None
+
+    if zoom < start_zoom:
+        return None
+    if end_zoom is not None and zoom >= end_zoom:
+        return None
+
+    quantize_fn_dotted_name = quantize_cfg.get(zoom)
+    if not quantize_fn_dotted_name:
+        # no changes at this zoom
+        return None
+
+    quantize_height_fn = resolve(quantize_fn_dotted_name)
+    for shape, props, fid in layer['features']:
+        height = props.get('height', None)
+        if height is not None:
+            props['height'] = quantize_height_fn(height)
+
+    return None
 
 
 def merge_building_features(ctx):
@@ -3078,12 +3732,10 @@ def merge_building_features(ctx):
     if end_zoom is not None and zoom >= end_zoom:
         return None
 
-    quantize_height_fn = None
-    quantize_cfg = ctx.params.get('quantize')
-    if quantize_cfg:
-        quantize_fn_dotted_name = quantize_cfg.get(zoom)
-        if quantize_fn_dotted_name:
-            quantize_height_fn = resolve(quantize_fn_dotted_name)
+    # this formula seems to give a good balance between larger values, which
+    # merge more but can merge everything into a blob if too large, and small
+    # values which retain detail.
+    tolerance = min(5, 0.4 * tolerance_for_zoom(zoom))
 
     def _props_pre((shape, props, fid)):
         if exclusions:
@@ -3100,11 +3752,6 @@ def merge_building_features(ctx):
             for prop in drop:
                 props.pop(prop, None)
 
-        if quantize_height_fn:
-            height = props.get('height', None)
-            if height is not None:
-                props['height'] = quantize_height_fn(height)
-
         return props
 
     def _props_post((merged_shape, props, fid)):
@@ -3117,8 +3764,9 @@ def merge_building_features(ctx):
         return props
 
     layer['features'] = _merge_features_by_property(
-        layer['features'], _POLYGON_DIMENSION, _props_pre, _props_post,
-        max_merged_features)
+        layer['features'], _POLYGON_DIMENSION, tolerance, _props_pre,
+        _props_post, max_merged_features,
+        merge_shape_fn=_merge_polygons_with_buffer)
     return layer
 
 
@@ -3135,6 +3783,9 @@ def merge_polygon_features(ctx):
     source_layer = ctx.params.get('source_layer')
     start_zoom = ctx.params.get('start_zoom', 0)
     end_zoom = ctx.params.get('end_zoom')
+    merge_min_zooms = ctx.params.get('merge_min_zooms', False)
+    buffer_merge = ctx.params.get('buffer_merge', False)
+    buffer_merge_tolerance = ctx.params.get('buffer_merge_tolerance')
 
     assert source_layer, 'merge_polygon_features: missing source layer'
     layer = _find_layer(ctx.feature_layers, source_layer)
@@ -3146,9 +3797,19 @@ def merge_polygon_features(ctx):
     if end_zoom is not None and zoom >= end_zoom:
         return None
 
+    tfz = tolerance_for_zoom(zoom)
+    if buffer_merge_tolerance:
+        tolerance = eval(buffer_merge_tolerance, {}, {
+            'tolerance_for_zoom': tfz,
+        })
+    else:
+        tolerance = tfz
+
     def _props_pre((shape, props, fid)):
         # drop area while merging, as we'll recalculate after.
         props.pop('area', None)
+        if merge_min_zooms:
+            props.pop('min_zoom', None)
         return props
 
     def _props_post((merged_shape, props, fid)):
@@ -3157,21 +3818,522 @@ def merge_polygon_features(ctx):
         props['area'] = area
         return props
 
+    def _props_merge(all_props):
+        merged_props = None
+        for props in all_props:
+            if merged_props is None:
+                merged_props = props.copy()
+            else:
+                min_zoom = props.get('min_zoom')
+                merged_min_zoom = merged_props.get('min_zoom')
+                if min_zoom and (merged_min_zoom is None or
+                                 min_zoom < merged_min_zoom):
+                    merged_props['min_zoom'] = min_zoom
+        return merged_props
+
+    merge_props_fn = _props_merge if merge_min_zooms else None
+    merge_shape_fn = _merge_polygons_with_buffer if buffer_merge else None
+
     layer['features'] = _merge_features_by_property(
-        layer['features'], _POLYGON_DIMENSION, _props_pre, _props_post)
+        layer['features'], _POLYGON_DIMENSION, tolerance, _props_pre,
+        _props_post, merge_props_fn=merge_props_fn,
+        merge_shape_fn=merge_shape_fn)
     return layer
+
+
+def _angle_at(linestring, pt):
+    import math
+
+    if pt == linestring.coords[0]:
+        nx = linestring.coords[1]
+    elif pt == linestring.coords[-1]:
+        nx = pt
+        pt = linestring.coords[-2]
+    else:
+        assert False, "Expected point to be first or last"
+
+    if nx == pt:
+        return None
+
+    dx = nx[0] - pt[0]
+    dy = nx[1] - pt[1]
+    if dy < 0.0:
+        dx = -dx
+        dy = -dy
+
+    a = math.atan2(dy, dx) / math.pi * 180.0
+
+    # wrap around at exactly 180, because we don't care about the direction of
+    # the road, only what angle the line is at, and 180 is horizontal same as
+    # 0.
+    if a == 180.0:
+        a = 0.0
+
+    assert 0 <= a < 180
+    return a
+
+
+def _junction_merge_candidates(ids, geoms, pt, angle_tolerance):
+    # find the angles at which the lines join the point
+    angles = []
+    for i in ids:
+        a = _angle_at(geoms[i], pt)
+        if a is not None:
+            angles.append((a, i))
+
+    # turn that into an angle->index associative list, so
+    # that we can tell which are the closest pair of angles.
+    angles.sort()
+
+    # list of pairs of ids, candidates to be merged.
+    candidates = []
+
+    # loop over the list, removing the closest pair, as long
+    # as they're within the tolerance angle of eachother.
+    while len(angles) > 1:
+        min_angle = None
+        for j in xrange(0, len(angles)):
+            angle1, idx1 = angles[j]
+            angle0, idx0 = angles[j-1]
+
+            # usually > 0 since angles are sorted, but might be negative
+            # on the first index (angles[-1]). note that, since we're
+            # taking the non-directional angle, the result should be
+            # between 0 and 180.
+            delta_angle = angle1 - angle0
+            if delta_angle < 0:
+                delta_angle += 180
+
+            if min_angle is None or delta_angle < min_angle[0]:
+                min_angle = (delta_angle, j)
+
+        if min_angle[0] >= angle_tolerance or min_angle is None:
+            break
+
+        candidates.append((angles[j][1], angles[j-1][1]))
+        del angles[j]
+        del angles[j-1]
+
+    return candidates
+
+
+def _merge_junctions_in_multilinestring(mls, angle_tolerance):
+    """
+    Merge LineStrings within a MultiLineString across junctions where more
+    than two lines meet and the lines appear to continue across the junction
+    at the same angle.
+
+    The angle_tolerance (in degrees) is used to judge whether two lines
+    look like they continue across a junction.
+
+    Returns a new shape.
+    """
+
+    endpoints = defaultdict(list)
+    for i, ls in enumerate(mls.geoms):
+        endpoints[ls.coords[0]].append(i)
+        endpoints[ls.coords[-1]].append(i)
+
+    seen = set()
+    merged_geoms = []
+    for pt, ids in endpoints.iteritems():
+        # we can't merge unless we've got at least 2 lines!
+        if len(ids) < 2:
+            continue
+
+        candidates = _junction_merge_candidates(
+            ids, mls.geoms, pt, angle_tolerance)
+        for a, b in candidates:
+            if a not in seen and b not in seen and a != b:
+                merged = linemerge(MultiLineString(
+                    [mls.geoms[a], mls.geoms[b]]))
+                if merged.geom_type == 'LineString':
+                    merged_geoms.append(merged)
+                    seen.add(a)
+                    seen.add(b)
+                elif (merged.geom_type == 'MultiLineString' and
+                      len(merged.geoms) == 1):
+                    merged_geoms.append(merged.geoms[0])
+                    seen.add(a)
+                    seen.add(b)
+
+    # add back any left over linestrings which didn't get merged.
+    for i, ls in enumerate(mls.geoms):
+        if i not in seen:
+            merged_geoms.append(ls)
+
+    if len(merged_geoms) == 1:
+        return merged_geoms[0]
+    else:
+        return MultiLineString(merged_geoms)
+
+
+def _loop_merge_junctions(geom, angle_tolerance):
+    """
+    Keep applying junction merging to the MultiLineString until there are no
+    merge opportunities left.
+
+    A single merge step will only carry out one merge per LineString, which
+    means that the other endpoint might miss out on a possible merge. So we
+    loop over the merge until all opportunities are exhausted: either we end
+    up with a single LineString or we run a step and it fails to merge any
+    candidates.
+
+    For a total number of possible merges, N, we could potentially be left
+    with two thirds of these left over, depending on the order of the
+    candidates. This means we should need only O(log N) steps to merge them
+    all.
+    """
+
+    if geom.geom_type != 'MultiLineString':
+        return geom
+
+    # keep track of the number of linestrings in the multilinestring. we'll
+    # use that to figure out if we've merged as much as we possibly can.
+    mls_size = len(geom.geoms)
+
+    while True:
+        geom = _merge_junctions_in_multilinestring(geom, angle_tolerance)
+
+        # merged everything down to a single linestring
+        if geom.geom_type == 'LineString':
+            break
+
+        # made no progress
+        elif len(geom.geoms) == mls_size:
+            break
+
+        assert len(geom.geoms) < mls_size, \
+            "Number of geometries should stay the same or reduce after merge."
+
+        # otherwise, keep looping
+        mls_size = len(geom.geoms)
+
+    return geom
+
+
+def _simplify_line_collection(shape, tolerance):
+    """
+    Calling simplify on a MultiLineString doesn't always simplify if it would
+    make the MultiLineString non-simple.
+
+    However, we're trying to sort linestrings into nonoverlapping sets, and we
+    don't care whether they overlap at this point. However, we do want to make
+    sure that any colinear points in the individual LineStrings are removed.
+    """
+
+    if shape.geom_type == 'LineString':
+        shape = shape.simplify(tolerance)
+
+    elif shape.geom_type == 'MultiLineString':
+        new_geoms = []
+        for geom in shape.geoms:
+            new_geoms.append(geom.simplify(tolerance))
+        shape = MultiLineString(new_geoms)
+
+    return shape
+
+
+def _merge_junctions(features, angle_tolerance, simplify_tolerance,
+                     split_threshold):
+    """
+    Merge LineStrings within MultiLineStrings within features across junction
+    boundaries where the lines appear to continue at the same angle.
+
+    If simplify_tolerance is provided, apply a simplification step. This can
+    help to remove colinear junction points left over from any merging.
+
+    Finally, group the lines into non-overlapping sets, each of which generates
+    a separate MultiLineString feature to ensure they're already simple and
+    further geometric operations won't re-introduce intersection points.
+
+    Large linestrings, with more than split_threshold members, use a slightly
+    different algorithm which is more efficient at very large sizes.
+
+    Returns a new list of features.
+    """
+
+    new_features = []
+    for shape, props, fid in features:
+        if shape.geom_type == 'MultiLineString':
+            shape = _loop_merge_junctions(shape, angle_tolerance)
+
+        if simplify_tolerance > 0.0:
+            shape = _simplify_line_collection(shape, simplify_tolerance)
+
+        if shape.geom_type == 'MultiLineString':
+            disjoint_shapes = _linestring_nonoverlapping_partition(
+                shape, split_threshold)
+            for disjoint_shape in disjoint_shapes:
+                new_features.append((disjoint_shape, props, None))
+
+        else:
+            new_features.append((shape, props, fid))
+
+    return new_features
+
+
+def _first_positive_integer_not_in(s):
+    """
+    Given a set of positive integers, s, return the smallest positive integer
+    which is _not_ in s.
+
+    For example:
+
+    >>> _first_positive_integer_not_in(set())
+    1
+    >>> _first_positive_integer_not_in(set([1]))
+    2
+    >>> _first_positive_integer_not_in(set([1,3,4]))
+    2
+    >>> _first_positive_integer_not_in(set([1,2,3,4]))
+    5
+    """
+
+    if len(s) == 0:
+        return 1
+
+    last = max(s)
+    for i in xrange(1, last):
+        if i not in s:
+            return i
+    return last + 1
+
+
+# utility class so that we can store the array index of the geometry
+# inside the shape index.
+class _geom_with_index(object):
+    def __init__(self, geom, index):
+        self.geom = geom
+        self.index = index
+        self._geom = geom._geom
+        self.is_empty = geom.is_empty
+
+
+class OrderedSTRTree(object):
+    """
+    An STR-tree geometry index which remembers the array index of the
+    geometries it was built with, and only returns geometries with lower
+    indices when queried.
+
+    This is used as a substitute for a dynamic index, where we'd be able
+    to add new geometries as the algorithm progressed.
+    """
+
+    def __init__(self, geoms):
+        self.shape_index = STRtree([
+            _geom_with_index(g, i) for i, g in enumerate(geoms)
+        ])
+
+    def query(self, shape, idx):
+        """
+        Return the index elements which have bounding boxes intersecting the
+        given shape _and_ have array indices less than idx.
+        """
+
+        for geom in self.shape_index.query(shape):
+            if geom.index < idx:
+                yield geom
+
+
+class SplitOrderedSTRTree(object):
+    """
+    An ordered STR-tree index which splits the geometries it is managing.
+
+    This is a simple, first-order approximation to a dynamic index. If the
+    input geometries are sorted by increasing size, then the "small" first
+    section are much less likely to overlap, and we know we're not interested
+    in anything in the "big" section because the index isn't large enough.
+
+    This should cut down the number of expensive queries, as well as the
+    number of subsequent intersection tests to check if the shapes within the
+    bounding boxes intersect.
+    """
+
+    def __init__(self, geoms):
+        split = int(0.75 * len(geoms))
+        self.small_index = STRtree([
+            _geom_with_index(g, i) for i, g in enumerate(geoms[0:split])
+        ])
+        self.big_index = STRtree([
+            _geom_with_index(g, i + split) for i, g in enumerate(geoms[split:])
+        ])
+        self.split = split
+
+    def query(self, shape, i):
+        for geom in self.small_index.query(shape):
+            if geom.index < i:
+                yield geom
+
+        # don't need to query the big index at all unless i >= split. this
+        # should cut down on the number of yielded items that need further
+        # intersection tests.
+        if i >= self.split:
+            for geom in self.big_index.query(shape):
+                if geom.index < i:
+                    yield geom
+
+
+def _linestring_nonoverlapping_partition(mls, split_threshold=15000):
+    """
+    Given a MultiLineString input, returns a list of MultiLineStrings
+    which are individually simple, but cover all the points in the
+    input MultiLineString.
+
+    The OGC definition of a MultiLineString says it's _simple_ if it
+    consists of simple LineStrings and the LineStrings only meet each
+    other at their endpoints. This means that anything which makes
+    MultiLineStrings simple is going to insert intersections between
+    crossing lines, and decompose them into separate LineStrings.
+
+    In general we _do not want_ this behaviour, as it prevents
+    simplification and results in more points in the geometry. However,
+    there are many operations which will result in simple outputs, such
+    as intersections and unions. Therefore, we would prefer to take the
+    hit of having multiple features, if the features can be decomposed
+    in such a way that they are individually simple.
+    """
+
+    # only interested in MultiLineStrings for this method!
+    assert mls.geom_type == 'MultiLineString'
+
+    # simple (and sub-optimal) greedy algorithm for making sure that
+    # linestrings don't intersect: put each into the first bucket which
+    # doesn't already contain a linestring which intersects it.
+    #
+    # this will be suboptimal. for example:
+    #
+    #      2 4
+    #      | |
+    # 3 ---+-+---
+    #      | |
+    # 1 -----+---
+    #        |
+    #
+    # (lines 1 & 2 do _not_ intersect).
+    #
+    # the greedy algorithm will use 3 buckets, as it'll put lines 1 & 2 in
+    # the same bucket, forcing 3 & 4 into individual buckets for a total
+    # of 3 buckets. optimally, we can bucket 1 & 3 together and 2 & 4
+    # together to only use 2 buckets. however, making this optimal seems
+    # like it might be a Hard problem.
+    #
+    # note that we don't create physical buckets, but assign each shape a
+    # bucket ID which hasn't been assigned to any other intersecting shape.
+    # we can assign these in an arbitrary order, and use an index to reduce
+    # the number of intersection tests needed down to O(n log n). this can
+    # matter quite a lot at low zooms, where it's possible to get 150,000
+    # tiny road segments in a single shape!
+
+    # sort the geometries before we use them. this can help if we sort things
+    # which have fewer intersections towards the front of the array, so that
+    # they can be done more quickly.
+    def _bbox_area(geom):
+        minx, miny, maxx, maxy = geom.bounds
+        return (maxx - minx) * (maxy - miny)
+
+    # if there's a large number of geoms, switch to the split index and sort
+    # so that the spatially largest objects are towards the end of the list.
+    # this should make it more likely that earlier queries are fast.
+    if len(mls.geoms) > split_threshold:
+        geoms = sorted(mls.geoms, key=_bbox_area)
+        shape_index = SplitOrderedSTRTree(geoms)
+    else:
+        geoms = mls.geoms
+        shape_index = OrderedSTRTree(geoms)
+
+    # first, assign everything the "null" bucket with index zero. this means
+    # we haven't gotten around to it yet, and we can use it as a sentinel
+    # value to check for logic errors.
+    bucket_for_shape = [0] * len(geoms)
+
+    for idx, shape in enumerate(geoms):
+        overlapping_buckets = set()
+
+        # assign the lowest bucket ID that hasn't been assigned to any
+        # overlapping shape with a lower index. this is because:
+        #  1. any overlapping shape would cause the insertion of a point if it
+        #     were allowed in this bucket, and
+        #  2. we're assigning in-order, so shapes at higher array indexes will
+        #     still be assigned to the null bucket. we'll get to them later!
+        for indexed_shape in shape_index.query(shape, idx):
+            if indexed_shape.geom.intersects(shape):
+                bucket = bucket_for_shape[indexed_shape.index]
+                assert bucket > 0
+                overlapping_buckets.add(bucket)
+
+        bucket_for_shape[idx] = _first_positive_integer_not_in(
+            overlapping_buckets)
+
+    results = []
+    for bucket_id in set(bucket_for_shape):
+        # by this point, no shape should be assigned to the null bucket any
+        # more.
+        assert bucket_id > 0
+
+        # collect all the shapes which have been assigned to this bucket.
+        shapes = []
+        for idx, shape in enumerate(geoms):
+            if bucket_for_shape[idx] == bucket_id:
+                shapes.append(shape)
+
+        if len(shapes) == 1:
+            results.append(shapes[0])
+        else:
+            results.append(MultiLineString(shapes))
+
+    return results
+
+
+def _drop_short_segments_from_multi(tolerance, mls):
+    return MultiLineString(
+        [g for g in mls.geoms if g.length >= tolerance])
+
+
+def _drop_short_segments(tolerance, features):
+    new_features = []
+
+    for shape, props, fid in features:
+        if shape.geom_type == 'MultiLineString':
+            shape = _drop_short_segments_from_multi(tolerance, shape)
+
+        elif shape.geom_type == 'LineString':
+            if shape.length < tolerance:
+                shape = None
+
+        if shape and not shape.is_empty:
+            new_features.append((shape, props, fid))
+
+    return new_features
 
 
 def merge_line_features(ctx):
     """
     Merge linestrings having the same properties, in the source_layer
     between start_zoom and end_zoom inclusive.
+
+    By default, will not merge features across points where more than
+    two lines meet. If you set merge_junctions, then it will try to
+    merge where the line looks contiguous.
     """
 
+    params = _Params(ctx, 'merge_line_features')
     zoom = ctx.nominal_zoom
-    source_layer = ctx.params.get('source_layer')
-    start_zoom = ctx.params.get('start_zoom', 0)
-    end_zoom = ctx.params.get('end_zoom')
+    source_layer = params.required('source_layer')
+    start_zoom = params.optional('start_zoom', default=0, typ=int)
+    end_zoom = params.optional('end_zoom', typ=int)
+    merge_junctions = params.optional(
+        'merge_junctions', default=False, typ=bool)
+    junction_angle_tolerance = params.optional(
+        'merge_junction_angle', default=15.0, typ=float)
+    drop_short_segments = params.optional(
+        'drop_short_segments', default=False, typ=bool)
+    short_segment_factor = params.optional(
+        'drop_length_pixels', default=0.1, typ=float)
+    simplify_tolerance = params.optional(
+        'simplify_tolerance', default=0.0, typ=float)
+    split_threshold = params.optional(
+        'split_threshold', default=15000, typ=int)
 
     assert source_layer, 'merge_line_features: missing source layer'
     layer = _find_layer(ctx.feature_layers, source_layer)
@@ -3184,7 +4346,18 @@ def merge_line_features(ctx):
         return None
 
     layer['features'] = _merge_features_by_property(
-        layer['features'], _LINE_DIMENSION)
+        layer['features'], _LINE_DIMENSION, simplify_tolerance)
+
+    if drop_short_segments:
+        tolerance = short_segment_factor * tolerance_for_zoom(zoom)
+        layer['features'] = _drop_short_segments(
+            tolerance, layer['features'])
+
+    if merge_junctions:
+        layer['features'] = _merge_junctions(
+            layer['features'], junction_angle_tolerance, simplify_tolerance,
+            split_threshold)
+
     return layer
 
 
@@ -3934,6 +5107,7 @@ def simplify_and_clip(ctx):
         padded_bounds = feature_layer['padded_bounds']
         area_threshold_pixels = layer_datum['area_threshold']
         area_threshold_meters = meters_per_pixel_area * area_threshold_pixels
+        layer_tolerance = layer_datum.get('tolerance', 1.0) * tolerance
 
         # The logic behind simplifying before intersecting rather than the
         # other way around is extensively explained here:
@@ -3968,14 +5142,14 @@ def simplify_and_clip(ctx):
                     max_y + gutter_bbox_size)
                 clipped_shape = shape.intersection(gutter_bbox)
                 simplified_shape = clipped_shape.simplify(
-                    tolerance, preserve_topology=True)
+                    layer_tolerance, preserve_topology=True)
                 shape = _make_valid_if_necessary(simplified_shape)
 
             if is_clipped:
                 shape = shape.intersection(layer_padded_bounds)
 
             if should_simplify and not simplify_before_intersect:
-                simplified_shape = shape.simplify(tolerance,
+                simplified_shape = shape.simplify(layer_tolerance,
                                                   preserve_topology=True)
                 shape = _make_valid_if_necessary(simplified_shape)
 
@@ -4157,7 +5331,7 @@ def _guess_network_gb(tags):
     # can recover it here.
     highway = tags.get('kind_detail')
 
-    ref = tags.get('ref')
+    ref = tags.get('ref', '')
     networks = []
     # although roads are part of only one network in the UK, some roads are
     # tagged incorrectly as being part of two, so we have to handle this case.
@@ -4196,22 +5370,39 @@ def _guess_network_gb(tags):
 
 def _guess_network_ar(tags):
     ref = tags.get('ref')
-    if ref.startswith('RN'):
+    if ref is None:
+        return None
+    elif ref.startswith('RN'):
         return [('AR:national', ref)]
     elif ref.startswith('RP'):
         return [('AR:provincial', ref)]
     return None
 
 
-def _guess_network_au(tags):
-    ref = tags.get('ref')
+def _guess_network_with(tags, fn):
+    """
+    Common function for backfilling (network, ref) pairs by running the
+    "normalize" function on the parts of the ref. For example, if the
+    ref was 'A1;B2;C3', then the normalize function would be run on
+    fn(None, 'A1'), fn(None, 'B2'), etc...
+
+    This allows us to back-fill the network where it can be deduced from
+    the ref in a particular country (e.g: if all motorways are A[0-9]).
+    """
+
+    ref = tags.get('ref', '')
     networks = []
     for part in ref.split(';'):
+        part = part.strip()
         if not part:
             continue
-        network, ref = _normalize_au_netref(None, part)
+        network, ref = fn(None, part)
         networks.append((network, part))
     return networks
+
+
+def _guess_network_au(tags):
+    return _guess_network_with(tags, _normalize_au_netref)
 
 
 # list of all the state codes in Brazil, see
@@ -4280,6 +5471,10 @@ def _guess_network_br(tags):
     ref = tags.get('ref')
     networks = []
 
+    # a missing or blank ref isn't going to give us much information
+    if not ref:
+        return networks
+
     # track last prefix, so that we can handle cases where the ref is written
     # as "BR-XXX/YYY" to mean "BR-XXX; BR-YYY".
     last_prefix = None
@@ -4326,11 +5521,15 @@ def _guess_network_ca(tags):
         # https://commons.wikimedia.org/wiki/File:TCH-16_(BC).svg
         networks.append(('CA:transcanada', ref))
 
+    if not networks and ref:
+        # final fallback - all we know is that this is a road in Canada.
+        networks.append(('CA', ref))
+
     return networks
 
 
 def _guess_network_ch(tags):
-    ref = tags.get('ref')
+    ref = tags.get('ref', '')
     networks = []
     for part in ref.split(';'):
         if not part:
@@ -4342,64 +5541,27 @@ def _guess_network_ch(tags):
 
 
 def _guess_network_cn(tags):
-    ref = tags.get('ref')
-    networks = []
-    for part in ref.split(';'):
-        if not part:
-            continue
-        network, ref = _normalize_cn_netref(None, part)
-        networks.append((network, part))
-    return networks
+    return _guess_network_with(tags, _normalize_cn_netref)
 
 
 def _guess_network_es(tags):
-    ref = tags.get('ref')
-    networks = []
-    for part in ref.split(';'):
-        part = part.strip()
-        if not part:
-            continue
-        network, ref = _normalize_es_netref(None, part)
-        if network or ref:
-            networks.append((network, ref))
-    return networks
+    return _guess_network_with(tags, _normalize_es_netref)
 
 
 def _guess_network_fr(tags):
-    ref = tags.get('ref')
-    networks = []
-    for part in ref.split(';'):
-        if not part:
-            continue
-        network, ref = _normalize_fr_netref(None, part)
-        networks.append((network, part))
-    return networks
+    return _guess_network_with(tags, _normalize_fr_netref)
 
 
 def _guess_network_de(tags):
-    ref = tags.get('ref')
-    networks = []
-    for part in ref.split(';'):
-        if not part:
-            continue
-        network, ref = _normalize_de_netref(None, part)
-        networks.append((network, part))
-    return networks
+    return _guess_network_with(tags, _normalize_de_netref)
 
 
 def _guess_network_ga(tags):
-    ref = tags.get('ref')
-    networks = []
-    for part in ref.split(';'):
-        if not part:
-            continue
-        network, ref = _normalize_ga_netref(None, part)
-        networks.append((network, part))
-    return networks
+    return _guess_network_with(tags, _normalize_ga_netref)
 
 
 def _guess_network_gr(tags):
-    ref = tags.get('ref')
+    ref = tags.get('ref', '')
     networks = []
     for part in ref.split(';'):
         if not part:
@@ -4416,62 +5578,36 @@ def _guess_network_gr(tags):
 
 
 def _guess_network_in(tags):
-    ref = tags.get('ref')
+    ref = tags.get('ref', '')
     networks = []
     for part in ref.split(';'):
         if not part:
             continue
         network, ref = _normalize_in_netref(None, part)
+        # note: we return _ref_ here, as normalize_in_netref might have changed
+        # the ref part (e.g: in order to split MDR54 into (network=MDR, ref=54)
         networks.append((network, ref))
     return networks
 
 
 def _guess_network_mx(tags):
-    ref = tags.get('ref')
-    networks = []
-    for part in ref.split(';'):
-        if not part:
-            continue
-        network, ref = _normalize_mx_netref(None, part)
-        networks.append((network, part))
-    return networks
+    return _guess_network_with(tags, _normalize_mx_netref)
 
 
 def _guess_network_my(tags):
-    ref = tags.get('ref')
-    networks = []
-    for part in ref.split(';'):
-        if not part:
-            continue
-        network, ref = _normalize_my_netref(None, part)
-        networks.append((network, part))
-    return networks
+    return _guess_network_with(tags, _normalize_my_netref)
 
 
 def _guess_network_no(tags):
-    ref = tags.get('ref')
-    networks = []
-    for part in ref.split(';'):
-        if not part:
-            continue
-        network, ref = _normalize_no_netref(None, part)
-        networks.append((network, part))
-    return networks
+    return _guess_network_with(tags, _normalize_no_netref)
 
 
 def _guess_network_pe(tags):
-    ref = tags.get('ref')
-    networks = []
-    for part in ref.split(';'):
-        if not part:
-            continue
-        network, ref = _normalize_pe_netref(None, part)
-        networks.append((network, part))
-    return networks
+    return _guess_network_with(tags, _normalize_pe_netref)
 
 
 def _guess_network_jp(tags):
-    ref = tags.get('ref')
+    ref = tags.get('ref', '')
 
     name = tags.get('name:ja') or tags.get('name')
     network_from_name = None
@@ -4498,7 +5634,7 @@ def _guess_network_jp(tags):
 
 
 def _guess_network_kr(tags):
-    ref = tags.get('ref')
+    ref = tags.get('ref', '')
     network_from_tags = tags.get('network')
 
     # the name often ends with a word which appears to mean expressway or
@@ -4542,73 +5678,39 @@ def _guess_network_kr(tags):
 
 
 def _guess_network_pl(tags):
-    ref = tags.get('ref')
-    networks = []
-
-    for part in ref.split(';'):
-        if not part:
-            continue
-        network, ref = _normalize_pl_netref(None, part)
-        networks.append((network, part))
-
-    return networks
+    return _guess_network_with(tags, _normalize_pl_netref)
 
 
 def _guess_network_pt(tags):
-    ref = tags.get('ref')
-    networks = []
-
-    for part in ref.split(';'):
-        if not part:
-            continue
-        network, ref = _normalize_pt_netref(None, part)
-        networks.append((network, part))
-
-    return networks
+    return _guess_network_with(tags, _normalize_pt_netref)
 
 
 def _guess_network_ro(tags):
-    ref = tags.get('ref')
-    networks = []
-
-    for part in ref.split(';'):
-        if not part:
-            continue
-        network, ref = _normalize_ro_netref(None, part)
-        if network or ref:
-            networks.append((network, part))
-
-    return networks
+    return _guess_network_with(tags, _normalize_ro_netref)
 
 
 def _guess_network_ru(tags):
-    ref = tags.get('ref')
+    ref = tags.get('ref', '')
+    network = tags.get('network')
     networks = []
 
     for part in ref.split(';'):
         if not part:
             continue
-        network, ref = _normalize_ru_netref(tags.get('network'), part)
+        # note: we pass in the network tag, as that can be important for
+        # disambiguating Russian refs.
+        network, ref = _normalize_ru_netref(network, part)
         networks.append((network, part))
 
     return networks
 
 
 def _guess_network_sg(tags):
-    ref = tags.get('ref')
-    networks = []
-
-    for part in ref.split(';'):
-        if not part:
-            continue
-        network, ref = _normalize_sg_netref(None, part)
-        networks.append((network, ref))
-
-    return networks
+    return _guess_network_with(tags, _normalize_sg_netref)
 
 
 def _guess_network_tr(tags):
-    ref = tags.get('ref')
+    ref = tags.get('ref', '')
     networks = []
 
     for part in _COMMON_SEPARATORS.split(ref):
@@ -4623,16 +5725,7 @@ def _guess_network_tr(tags):
 
 
 def _guess_network_ua(tags):
-    ref = tags.get('ref')
-    networks = []
-
-    for part in ref.split(';'):
-        if not part:
-            continue
-        network, ref = _normalize_ua_netref(tags.get('network'), part)
-        networks.append((network, part))
-
-    return networks
+    return _guess_network_with(tags, _normalize_ua_netref)
 
 
 _COMMON_SEPARATORS = re.compile('[;,/,]')
@@ -5297,7 +6390,8 @@ def _normalize_br_netref(network, ref):
     # try to add detail to the network by looking at the ref value,
     # which often has additional information.
     for guess_net, guess_ref in _guess_network_br(dict(ref=ref)):
-        if guess_ref == ref and guess_net.startswith(network):
+        if guess_ref == ref and (
+                network is None or guess_net.startswith(network)):
             network = guess_net
             break
 
@@ -5307,7 +6401,7 @@ def _normalize_br_netref(network, ref):
         else:
             return network, ref
 
-    elif network.startswith('BR:'):
+    elif network and network.startswith('BR:'):
         # turn things like "BR:BA-roads" into just "BR:BA"
         if network.endswith('-roads'):
             network = network[:-6]
@@ -5361,13 +6455,13 @@ def _normalize_ch_netref(network, ref):
 
 
 def _normalize_cn_netref(network, ref):
-    if ref.startswith('S'):
+    if ref and ref.startswith('S'):
         network = 'CN:expressway:regional'
 
-    elif ref.startswith('G'):
+    elif ref and ref.startswith('G'):
         network = 'CN:expressway'
 
-    elif ref.startswith('X'):
+    elif ref and ref.startswith('X'):
         network = 'CN:JX'
 
     elif network == 'CN-expressways':
@@ -5503,9 +6597,6 @@ _ES_CITIES = set([
 def _normalize_es_netref(network, ref):
     prefix, num = _splitref(ref)
 
-    if num:
-        num = num.lstrip('-')
-
     # some A-roads in Spain are actually province or autonoma roads. these are
     # distinguished from the national A-roads by whether they have 1 or 2
     # digits (national) or 3 or more digits (autonoma / province). sadly, it
@@ -5513,19 +6604,22 @@ def _normalize_es_netref(network, ref):
     # without looking at the geometry, which is left as a TODO for later rainy
     # days.
     num_digits = 0
-    for i in xrange(0, len(num)):
-        if num[i].isdigit():
-            num_digits += 1
-        else:
-            break
+    if num:
+        num = num.lstrip('-')
 
-    if prefix in ('A', 'AP') and num_digits < 3:
+        for c in num:
+            if c.isdigit():
+                num_digits += 1
+            else:
+                break
+
+    if prefix in ('A', 'AP') and num_digits > 0 and num_digits < 3:
         network = 'ES:A-road'
 
     elif prefix == 'N':
         network = 'ES:N-road'
 
-    elif prefix == 'E':
+    elif prefix == 'E' and num:
         # e-roads seem to be signed without leading zeros.
         network = 'e-road'
         ref = 'E-' + num.lstrip('0')
@@ -5560,7 +6654,8 @@ def _normalize_fr_netref(network, ref):
             prefix = 'N'
 
         # strip spaces and leading zeros
-        ref = prefix + ref.strip().lstrip('0')
+        if ref:
+            ref = prefix + ref.strip().lstrip('0')
 
         # backfill network from refs if network wasn't provided from another
         # source.
@@ -5891,7 +6986,7 @@ def _normalize_no_netref(network, ref):
         network = 'NO:fylkesvei'
         ref = number
 
-    elif prefix == 'E':
+    elif prefix == 'E' and number:
         network = 'e-road'
         ref = 'E ' + number.lstrip('0')
 
@@ -5974,9 +7069,9 @@ def _normalize_pl_netref(network, ref):
     elif network == 'PL:expressways':
         network = 'PL:expressway'
 
-    if ref.startswith('A'):
+    if ref and ref.startswith('A'):
         network = 'PL:motorway'
-    elif ref.startswith('S'):
+    elif ref and ref.startswith('S'):
         network = 'PL:expressway'
 
     return network, ref
@@ -6006,7 +7101,7 @@ def _normalize_pt_netref(network, ref):
     prefix, num = _splitref(ref)
 
     result = _PT_NETWORK_EXPANSION.get(prefix)
-    if result:
+    if result and num:
         network, letter = result
         ref = letter + num.lstrip('0')
 
@@ -6115,12 +7210,12 @@ def _normalize_tr_netref(network, ref):
     if num:
         num = num.lstrip('-')
 
-    if prefix == 'O':
+    if prefix == 'O' and num:
         # see https://en.wikipedia.org/wiki/Otoyol
         network = 'TR:motorway'
         ref = 'O' + num.lstrip('0')
 
-    elif prefix == 'D':
+    elif prefix == 'D' and num:
         # see https://en.wikipedia.org/wiki/Turkish_State_Highway_System
         network = 'TR:highway'
         # drop section suffixes
@@ -6129,7 +7224,7 @@ def _normalize_tr_netref(network, ref):
     elif ref and _TR_PROVINCIAL.match(ref):
         network = 'TR:provincial'
 
-    elif prefix == 'E':
+    elif prefix == 'E' and num:
         network = 'e-road'
         ref = 'E' + num
 
@@ -6144,9 +7239,14 @@ def _normalize_ua_netref(network, ref):
     ref = _make_unicode_or_none(ref)
     prefix, num = _splitref(ref)
 
-    num = num.lstrip('-')
+    if num:
+        num = num.lstrip('-')
 
-    if prefix in (u'М', 'M'):  # cyrillic M & latin M!
+    if not num:
+        network = None
+        ref = None
+
+    elif prefix in (u'М', 'M'):  # cyrillic M & latin M!
         if network is None:
             network = 'UA:international'
         ref = u'М' + num
@@ -6186,7 +7286,11 @@ def _normalize_vn_netref(network, ref):
     if num:
         num = num.lstrip(u'.')
 
-    if prefix == u'CT' or network == 'VN:expressway':
+    if not num:
+        network = None
+        ref = None
+
+    elif prefix == u'CT' or network == 'VN:expressway':
         network = 'VN:expressway'
         ref = u'CT' + num
 
@@ -6216,7 +7320,7 @@ def _normalize_vn_netref(network, ref):
 
 def _normalize_za_netref(network, ref):
     prefix, num = _splitref(ref)
-    ndigits = len(num)
+    ndigits = len(num) if num else 0
 
     # N, R & M numbered routes all have special shields which have the letter
     # above the number, which would make it part of the shield artwork rather
@@ -6263,12 +7367,30 @@ def _normalize_za_netref(network, ref):
 def _shield_text_ar(network, ref):
     # Argentinian national routes start with "RN" (ruta nacional), which
     # should be stripped, but other letters shouldn't be!
-    if network == 'AR:national' and ref.startswith('RN'):
+    if network == 'AR:national' and ref and ref.startswith('RN'):
         return ref[2:]
 
     # Argentinian provincial routes start with "RP" (ruta provincial)
-    if network == 'AR:provincial' and ref.startswith('RP'):
+    if network == 'AR:provincial' and ref and ref.startswith('RP'):
         return ref[2:]
+
+    return ref
+
+
+_AU_NETWORK_SHIELD_TEXT = {
+    'AU:M-road': 'M',
+    'AU:A-road': 'A',
+    'AU:B-road': 'B',
+    'AU:C-road': 'C',
+}
+
+
+def _shield_text_au(network, ref):
+    # shields on M, A, B & C roads should have the letter, but not other types
+    # of roads.
+    prefix = _AU_NETWORK_SHIELD_TEXT.get(network)
+    if prefix:
+        ref = prefix + ref
 
     return ref
 
@@ -6276,7 +7398,10 @@ def _shield_text_ar(network, ref):
 def _shield_text_gb(network, ref):
     # just remove any space between the letter and number(s)
     prefix, number = _splitref(ref)
-    return prefix + number
+    if prefix and number:
+        return prefix + number
+    else:
+        return ref
 
 
 def _shield_text_ro(network, ref):
@@ -6334,6 +7459,7 @@ _COUNTRY_SPECIFIC_ROAD_NETWORK_LOGIC = {
         backfill=_guess_network_au,
         fix=_normalize_au_netref,
         sort=_sort_network_au,
+        shield_text=_shield_text_au,
     ),
     'BR': CountryNetworkLogic(
         backfill=_guess_network_br,
@@ -6724,11 +7850,11 @@ def _bus_network_importance(network, ref):
     return _generic_network_importance(network, ref, {})
 
 
-_NUMBER_AT_FRONT = re.compile('^(\d+\w*)', re.UNICODE)
-_SINGLE_LETTER_AT_FRONT = re.compile('^([^\W\d]) *(\d+)', re.UNICODE)
-_LETTER_THEN_NUMBERS = re.compile('^[^\d\s_]+[ -]?([^\s]+)',
+_NUMBER_AT_FRONT = re.compile(r'^(\d+\w*)', re.UNICODE)
+_SINGLE_LETTER_AT_FRONT = re.compile(r'^([^\W\d]) *(\d+)', re.UNICODE)
+_LETTER_THEN_NUMBERS = re.compile(r'^[^\d\s_]+[ -]?([^\s]+)',
                                   re.UNICODE | re.IGNORECASE)
-_UA_TERRITORIAL_RE = re.compile('^(\w)-(\d+)-(\d+)$',
+_UA_TERRITORIAL_RE = re.compile(r'^(\w)-(\d+)-(\d+)$',
                                 re.UNICODE | re.IGNORECASE)
 
 
@@ -6900,6 +8026,7 @@ def _choose_most_important_network(properties, prefix, importance_fn):
 
     networks = properties.pop(all_networks, None)
     shield_texts = properties.pop(all_shield_texts, None)
+    country_code = properties.get('country_code')
 
     if networks and shield_texts:
         def network_key(t):
@@ -6922,7 +8049,8 @@ def _choose_most_important_network(properties, prefix, importance_fn):
                 new_tuples.append((network, ref))
 
             elif ref is not None and ref not in seen_ref:
-                new_tuples.append((network, ref))
+                # network is None, fall back to the country code
+                new_tuples.append((country_code, ref))
 
         tuples = new_tuples
 
@@ -7033,6 +8161,18 @@ def truncate_min_zoom_to_2dp(shape, properties, fid, zoom):
     min_zoom = properties.get('min_zoom')
     if min_zoom:
         properties['min_zoom'] = round(min_zoom, 2)
+
+    return shape, properties, fid
+
+
+def truncate_min_zoom_to_1dp(shape, properties, fid, zoom):
+    """
+    Truncate the "min_zoom" property to one decimal place.
+    """
+
+    min_zoom = properties.get('min_zoom')
+    if min_zoom:
+        properties['min_zoom'] = round(min_zoom, 1)
 
     return shape, properties, fid
 
@@ -7382,6 +8522,32 @@ def max_zoom_filter(ctx):
     return None
 
 
+def min_zoom_filter(ctx):
+    """
+    For features with a min_zoom, remove them if it's > nominal zoom + 1.
+    """
+
+    params = _Params(ctx, 'min_zoom_filter')
+    layers = params.required('layers', typ=list)
+    nominal_zoom = ctx.nominal_zoom
+
+    for layer_name in layers:
+        layer = _find_layer(ctx.feature_layers, layer_name)
+
+        features = layer['features']
+        new_features = []
+
+        for feature in features:
+            _, props, _ = feature
+            min_zoom = props.get('min_zoom')
+            if min_zoom is not None and min_zoom < nominal_zoom + 1:
+                new_features.append(feature)
+
+        layer['features'] = new_features
+
+    return None
+
+
 def tags_set_ne_min_max_zoom(ctx):
     """
     Override the min zoom and max zoom properties with __ne_* variants from
@@ -7395,10 +8561,723 @@ def tags_set_ne_min_max_zoom(ctx):
     for _, props, _ in layer['features']:
         min_zoom = props.pop('__ne_min_zoom', None)
         if min_zoom is not None:
+            # don't overstuff features into tiles when they are in the
+            # long tail of won't display, but make their min_zoom
+            # consistent with when they actually show in tiles
+            if min_zoom % 1 > 0.5:
+                min_zoom = ceil(min_zoom)
             props['min_zoom'] = min_zoom
+
+        elif props.get('kind') == 'country':
+            # countries and regions which don't have a min zoom joined from NE
+            # are probably either vandalism or unrecognised countries. either
+            # way, we probably don't want to see them at zoom, which is lower
+            # than most of the curated NE min zooms. see issue #1826 for more
+            # information.
+            props['min_zoom'] = max(6, props['min_zoom'])
+
+        elif props.get('kind') == 'region':
+            props['min_zoom'] = max(8, props['min_zoom'])
 
         max_zoom = props.pop('__ne_max_zoom', None)
         if max_zoom is not None:
             props['max_zoom'] = max_zoom
 
     return None
+
+
+def whitelist(ctx):
+    """
+    Applies a whitelist to a particular property on all features in the layer,
+    optionally also remapping some values.
+    """
+
+    params = _Params(ctx, 'whitelist')
+    layer_name = params.required('layer')
+    start_zoom = params.optional('start_zoom', default=0, typ=int)
+    end_zoom = params.optional('end_zoom', typ=int)
+    property_name = params.required('property')
+    whitelist = params.required('whitelist', typ=list)
+    remap = params.optional('remap', default={}, typ=dict)
+    where = params.optional('where')
+
+    # check that we're in the zoom range where this post-processor is supposed
+    # to operate.
+    if ctx.nominal_zoom < start_zoom:
+        return None
+    if end_zoom is not None and ctx.nominal_zoom >= end_zoom:
+        return None
+
+    if where is not None:
+        where = compile(where, 'queries.yaml', 'eval')
+
+    layer = _find_layer(ctx.feature_layers, layer_name)
+
+    features = layer['features']
+    for feature in features:
+        _, props, _ = feature
+
+        # skip this feature if there's a where clause and it evaluates falsey.
+        if where is not None:
+            local = props.copy()
+            local['zoom'] = ctx.nominal_zoom
+            if not eval(where, {}, local):
+                continue
+
+        value = props.get(property_name)
+        if value is not None:
+            if value in whitelist:
+                # leave value as-is
+                continue
+
+            elif value in remap:
+                # replace with replacement value
+                props[property_name] = remap[value]
+
+            else:
+                # drop the property
+                props.pop(property_name)
+
+    return None
+
+
+def remap(ctx):
+    """
+    Maps some values for a particular property to others. Similar to whitelist,
+    but won't remove the property if there's no match.
+    """
+
+    params = _Params(ctx, 'remap')
+    layer_name = params.required('layer')
+    start_zoom = params.optional('start_zoom', default=0, typ=int)
+    end_zoom = params.optional('end_zoom', typ=int)
+    property_name = params.required('property')
+    remap = params.optional('remap', default={}, typ=dict)
+    where = params.optional('where')
+
+    # check that we're in the zoom range where this post-processor is supposed
+    # to operate.
+    if ctx.nominal_zoom < start_zoom:
+        return None
+    if end_zoom is not None and ctx.nominal_zoom >= end_zoom:
+        return None
+
+    if where is not None:
+        where = compile(where, 'queries.yaml', 'eval')
+
+    layer = _find_layer(ctx.feature_layers, layer_name)
+
+    features = layer['features']
+    for feature in features:
+        shape, props, _ = feature
+
+        # skip this feature if there's a where clause and it evaluates falsey.
+        if where is not None:
+            local = props.copy()
+            local['zoom'] = ctx.nominal_zoom
+            local['geom_type'] = shape.geom_type
+            if not eval(where, {}, local):
+                continue
+
+        value = props.get(property_name)
+        if value in remap:
+            # replace with replacement value
+            props[property_name] = remap[value]
+
+    return None
+
+
+def backfill(ctx):
+    """
+    Backfills default values for some features. In other words, if the feature
+    lacks some or all of the defaults, then set those defaults.
+    """
+
+    params = _Params(ctx, 'whitelist')
+    layer_name = params.required('layer')
+    start_zoom = params.optional('start_zoom', default=0, typ=int)
+    end_zoom = params.optional('end_zoom', typ=int)
+    defaults = params.required('defaults', typ=dict)
+    where = params.optional('where')
+
+    # check that we're in the zoom range where this post-processor is supposed
+    # to operate.
+    if ctx.nominal_zoom < start_zoom:
+        return None
+    if end_zoom is not None and ctx.nominal_zoom >= end_zoom:
+        return None
+
+    if where is not None:
+        where = compile(where, 'queries.yaml', 'eval')
+
+    layer = _find_layer(ctx.feature_layers, layer_name)
+
+    features = layer['features']
+    for feature in features:
+        _, props, _ = feature
+
+        # skip this feature if there's a where clause and it evaluates truthy.
+        if where is not None:
+            local = props.copy()
+            local['zoom'] = ctx.nominal_zoom
+            if not eval(where, {}, local):
+                continue
+
+        for k, v in defaults.iteritems():
+            if k not in props:
+                props[k] = v
+
+    return None
+
+
+def clamp_min_zoom(ctx):
+    """
+    Clamps the min zoom for features depending on context.
+    """
+
+    params = _Params(ctx, 'clamp_min_zoom')
+    layer_name = params.required('layer')
+    start_zoom = params.optional('start_zoom', default=0, typ=int)
+    end_zoom = params.optional('end_zoom', typ=int)
+    clamp = params.required('clamp', typ=dict)
+    property_name = params.required('property')
+
+    # check that we're in the zoom range where this post-processor is supposed
+    # to operate.
+    if ctx.nominal_zoom < start_zoom:
+        return None
+    if end_zoom is not None and ctx.nominal_zoom >= end_zoom:
+        return None
+
+    layer = _find_layer(ctx.feature_layers, layer_name)
+
+    features = layer['features']
+    for feature in features:
+        _, props, _ = feature
+
+        value = props.get(property_name)
+        min_zoom = props.get('min_zoom')
+
+        if value is not None and min_zoom is not None:
+            min_val = clamp.get(value)
+            if min_val is not None and min_val > min_zoom:
+                props['min_zoom'] = min_val
+
+    return None
+
+
+def add_vehicle_restrictions(shape, props, fid, zoom):
+    """
+    Parse the maximum height, weight, length, etc... restrictions on vehicles
+    and create the `hgv_restriction` and `hgv_restriction_shield_text`.
+    """
+
+    from math import floor
+
+    def _one_dp(val, unit):
+        deci = int(floor(10 * val))
+        if deci % 10 == 0:
+            return "%d%s" % (deci / 10, unit)
+        return "%.1f%s" % (0.1 * deci, unit)
+
+    def _metres(val):
+        # parse metres or feet and inches, return cm
+        metres = _to_float_meters(val)
+        if metres:
+            return True, _one_dp(metres, 'm')
+        return False, None
+
+    def _tonnes(val):
+        tonnes = to_float(val)
+        if tonnes:
+            return True, _one_dp(tonnes, 't')
+        return False, None
+
+    def _false(val):
+        return val == 'no', None
+
+    Restriction = namedtuple('Restriction', 'kind parse')
+
+    restrictions = {
+        'maxwidth': Restriction('width', _metres),
+        'maxlength': Restriction('length', _metres),
+        'maxheight': Restriction('height', _metres),
+        'maxweight': Restriction('weight', _tonnes),
+        'maxaxleload': Restriction('wpa', _tonnes),
+        'hazmat': Restriction('hazmat', _false),
+    }
+
+    hgv_restriction = None
+    hgv_restriction_shield_text = None
+
+    for osm_key, restriction in restrictions.items():
+        osm_val = props.pop(osm_key, None)
+        if osm_val is None:
+            continue
+
+        restricted, shield_text = restriction.parse(osm_val)
+        if not restricted:
+            continue
+
+        if hgv_restriction is None:
+            hgv_restriction = restriction.kind
+            hgv_restriction_shield_text = shield_text
+
+        else:
+            hgv_restriction = 'multiple'
+            hgv_restriction_shield_text = None
+
+    if hgv_restriction:
+        props['hgv_restriction'] = hgv_restriction
+    if hgv_restriction_shield_text:
+        props['hgv_restriction_shield_text'] = hgv_restriction_shield_text
+
+    return shape, props, fid
+
+
+def load_collision_ranker(fh):
+    import yaml
+    from vectordatasource.collision import CollisionRanker
+
+    data = yaml.load(fh)
+    assert isinstance(data, list)
+
+    return CollisionRanker(data)
+
+
+def add_collision_rank(ctx):
+    """
+    Add or update a collision_rank property on features in the given layers.
+    The collision rank is looked up from a YAML file consisting of a list of
+    filters (same syntax as in kind/min_zoom YAML) and "_reserved" blocks.
+    Collision rank indices are automatically assigned based on where in the
+    list a matching filter is found.
+    """
+
+    feature_layers = ctx.feature_layers
+    zoom = ctx.nominal_zoom
+    start_zoom = ctx.params.get('start_zoom', 0)
+    end_zoom = ctx.params.get('end_zoom')
+    ranker = ctx.resources.get('ranker')
+    where = ctx.params.get('where')
+
+    assert ranker, 'add_collision_rank: missing ranker resource'
+
+    if zoom < start_zoom:
+        return None
+
+    if end_zoom is not None and zoom >= end_zoom:
+        return None
+
+    if where:
+        where = compile(where, 'queries.yaml', 'eval')
+
+    for layer in feature_layers:
+        layer_name = layer['layer_datum']['name']
+        for shape, props, fid in layer['features']:
+            # use the "where" clause to limit the selection of features which
+            # we add collision_rank to.
+            add_collision_rank = True
+            if where:
+                local = defaultdict(lambda: None)
+                local.update(props)
+                local['layer_name'] = layer_name
+                local['_has_name'] = _has_name(props)
+                add_collision_rank = eval(where, {}, local)
+
+            if add_collision_rank:
+                props_with_layer = props.copy()
+                props_with_layer['$layer'] = layer_name
+                rank = ranker((shape, props_with_layer, fid))
+                if rank is not None:
+                    props['collision_rank'] = rank
+
+    return None
+
+
+# mappings from the fclass_XXX values in the Natural Earth disputed areas data
+# to the matching Tilezen kind.
+_REMAP_VIEWPOINT_KIND = {
+    'Disputed (please verify)': 'disputed',
+    'Indefinite (please verify)': 'indefinite',
+    'Indeterminant frontier': 'indeterminate',
+    'International boundary (verify)': 'country',
+    'Lease limit': 'lease_limit',
+    'Line of control (please verify)': 'line_of_control',
+    'Overlay limit': 'overlay_limit',
+    'Unrecognized': 'unrecognized_country',
+    'Map unit boundary': 'map_unit',
+    'Breakaway': 'disputed_breakaway',
+    'Claim boundary': 'disputed_claim',
+    'Elusive frontier': 'disputed_elusive',
+    'Reference line': 'disputed_reference_line',
+    'Admin-1 region boundary': 'macroregion',
+    'Admin-1 boundary': 'region',
+    'Admin-1 statistical boundary': 'region',
+    'Admin-1 statistical meta bounds': 'region',
+    '1st Order Admin Lines': 'region',
+    'Unrecognized Admin-1 region boundary': 'unrecognized_macroregion',
+    'Unrecognized Admin-1 boundary': 'unrecognized_region',
+    'Unrecognized Admin-1 statistical boundary': 'unrecognized_region',
+    'Unrecognized Admin-1 statistical meta bounds': 'unrecognized_region',
+}
+
+
+def remap_viewpoint_kinds(shape, props, fid, zoom):
+    """
+    Remap Natural Earth kinds in kind:* country viewpoints into the standard
+    Tilezen nomenclature.
+    """
+
+    for key in props.keys():
+        if key.startswith('kind:'):
+            props[key] = _REMAP_VIEWPOINT_KIND.get(props[key])
+
+    return (shape, props, fid)
+
+
+def _list_of_countries(value):
+    """
+    Parses a comma or semicolon delimited list of ISO 3166-1 alpha-2 codes,
+    discarding those which don't match our expected format. We also allow a
+    special pseudo-country code "iso".
+
+    Returns a list of lower-case, stripped country codes (plus "iso").
+    """
+
+    from re import match
+    from re import split
+
+    countries = []
+    candidates = split('[,;]', value)
+
+    for candidate in candidates:
+        # should have an ISO 3166-1 alpha-2 code, so should be 2 ASCII
+        # latin characters.
+        candidate = candidate.strip().lower()
+        if candidate == 'iso' or match('[a-z][a-z]', candidate):
+            countries.append(candidate)
+
+    return countries
+
+
+def unpack_viewpoint_claims(shape, props, fid, zoom):
+    """
+    Unpack OSM "claimed_by" list into viewpoint kinds.
+
+    For example; "claimed_by=AA;BB;CC" should become "kind:aa=country,
+    kind:bb=country, kind:cc=country" (or region, etc... as appropriate for
+    the main kind, which should be "unrecognized_TYPE".
+
+    Additionally, "recognized_by=XX;YY;ZZ" indicates that these viewpoints,
+    although they don't claim the territory, recognize the claim and should
+    see it in their viewpoint as a country/region/county.
+    """
+
+    prefix = 'unrecognized_'
+    kind = props.get('kind')
+    claimed_by = props.get('claimed_by')
+    recognized_by = props.get('recognized_by')
+
+    if kind and kind.startswith(prefix) and claimed_by:
+        claimed_kind = kind[len(prefix):]
+
+        for country in _list_of_countries(claimed_by):
+            props['kind:' + country] = claimed_kind
+
+        if recognized_by:
+            for viewpoint in _list_of_countries(recognized_by):
+                props['kind:' + viewpoint] = claimed_kind
+
+    return (shape, props, fid)
+
+
+class _DisputeMasks(object):
+    """
+    Creates a "mask" of polygons by buffering disputed border lines and
+    provides an interface through cut() to intersect other border lines and
+    apply kind:xx=unrecognized_* to them.
+
+    This allows us to handle disputed borders - we effectively clip them out
+    of the disputant's viewpoint by setting a property that will hide them.
+    """
+
+    def __init__(self, buffer_distance):
+        self.buffer_distance = buffer_distance
+        self.masks = []
+
+    def add(self, shape, props):
+        from shapely.geometry import CAP_STYLE
+        from shapely.geometry import JOIN_STYLE
+
+        disputed_by = props.get('disputed_by', '')
+        disputants = _list_of_countries(disputed_by)
+
+        if disputants:
+            # we use a flat cap to avoid straying too much into nearby lines
+            # and a mitred join to avoid creating extra geometry points to
+            # represent the curve, as this slows down intersection checks.
+            buffered_shape = shape.buffer(
+                self.buffer_distance, CAP_STYLE.flat, JOIN_STYLE.mitre)
+            self.masks.append((buffered_shape, disputants))
+
+    def empty(self):
+        return not self.masks
+
+    def cut(self, shape, props, fid):
+        """
+        Cut the (shape, props, fid) feature against the masks to apply the
+        dispute to the boundary by setting 'kind:xx' to unrecognized.
+        """
+
+        updated_features = []
+
+        # figure out what we want the boundary kind to be, if it's intersected
+        # with the dispute mask.
+        kind = props['kind']
+        if kind.startswith('unrecognized_'):
+            unrecognized = kind
+        else:
+            unrecognized = 'unrecognized_' + kind
+
+        for mask_shape, disputants in self.masks:
+            # we don't want to override a kind:xx if it has already been set
+            # (e.g: by a claim), so we filter out disputant viewpoints where
+            # a kind override has already been set.
+            #
+            # this is necessary for dealing with the case where a border is
+            # both claimed and disputed in the same viewpoint.
+            non_claim_disputants = []
+            for disputant in disputants:
+                key = 'kind:' + disputant
+                if key not in props:
+                    non_claim_disputants.append(disputant)
+
+            if shape.intersects(mask_shape):
+                cut_shape = shape.intersection(mask_shape)
+                cut_shape = _filter_geom_types(cut_shape, _LINE_DIMENSION)
+
+                shape = shape.difference(mask_shape)
+                shape = _filter_geom_types(shape, _LINE_DIMENSION)
+
+                if not cut_shape.is_empty:
+                    new_props = props.copy()
+                    for disputant in non_claim_disputants:
+                        new_props['kind:' + disputant] = unrecognized
+                    updated_features.append((cut_shape, new_props, None))
+
+        if not shape.is_empty:
+            updated_features.append((shape, props, fid))
+
+        return updated_features
+
+
+# tuple of boundary kind values on which we should set alternate viewpoints
+# from disputed_by ways.
+_BOUNDARY_KINDS = ('country', 'region', 'county', 'locality',
+                   'aboriginal_lands')
+
+
+def apply_disputed_boundary_viewpoints(ctx):
+    """
+    Use the dispute features to apply viewpoints to the admin boundaries.
+
+    We take the 'mz_internal_dispute_mask' features and build a mask from them.
+    The mask is used to move the information from 'disputed_by' lists on the
+    mask features to 'kind:xx' overrides on the boundary features. The mask
+    features are discarded afterwards.
+    """
+
+    params = _Params(ctx, 'apply_disputed_boundary_viewpoints')
+    layer_name = params.required('base_layer')
+    start_zoom = params.optional('start_zoom', typ=int, default=0)
+    end_zoom = params.optional('end_zoom', typ=int)
+
+    layer = _find_layer(ctx.feature_layers, layer_name)
+    zoom = ctx.nominal_zoom
+
+    if zoom < start_zoom or \
+       (end_zoom is not None and zoom >= end_zoom):
+        return None
+
+    # we tried intersecting lines against lines, but this often led to a sort
+    # of "dashed pattern" in the output where numerical imprecision meant two
+    # lines don't quite intersect.
+    #
+    # we solve this by buffering out the shape by a small amount so that we're
+    # more likely to get a clean cut against the boundary line.
+    #
+    # tolerance for zoom is the length of 1px at 256px per tile, so we can take
+    # a fraction of that to get sub-pixel alignment.
+    buffer_distance = 0.1 * tolerance_for_zoom(zoom)
+
+    # first, separate out the dispute mask geometries
+    masks = _DisputeMasks(buffer_distance)
+
+    # features that we're going to return
+    new_features = []
+
+    # boundaries, which we pull out separately to apply the disputes to
+    boundaries = []
+
+    for shape, props, fid in layer['features']:
+        kind = props.get('kind')
+
+        if kind == 'mz_internal_dispute_mask':
+            masks.add(shape, props)
+
+        elif kind in _BOUNDARY_KINDS:
+            boundaries.append((shape, props, fid))
+
+        # we want to apply disputes to already generally-unrecognised borders
+        # too, as this allows for multi-level fallback from one viewpoint
+        # possibly through several others before reaching the default.
+        elif (kind.startswith('unrecognized_') and
+              kind[len('unrecognized_'):] in _BOUNDARY_KINDS):
+            boundaries.append((shape, props, fid))
+
+        else:
+            # pass through this feature - we just ignore it.
+            new_features.append((shape, props, fid))
+
+    # quick escape if there are no masks (which should be the common case)
+    if masks.empty():
+        # keep the boundaries and other features we already passed through,
+        # but drop the masks - we don't want them in the output.
+        new_features.extend(boundaries)
+
+    else:
+        for shape, props, fid in boundaries:
+            # cut boundary features against disputes and set the alternate
+            # viewpoint on any which intersect.
+            features = masks.cut(shape, props, fid)
+            new_features.extend(features)
+
+    layer['features'] = new_features
+    return layer
+
+
+def update_min_zoom(ctx):
+    """
+    Update the min zoom for features matching the Python fragment "where"
+    clause. If none is provided, update all features.
+
+    The new min_zoom is calculated by evaluating a Python fragment passed
+    in through the "min_zoom" parameter. This is evaluated in the context
+    of the features' parameters, plus a zoom variable.
+
+    If the min zoom is lower than the current min zoom, the current one is
+    kept. If the min zoom is increased, then it's checked against the
+    current zoom and the feature dropped if it's not in range.
+    """
+
+    params = _Params(ctx, 'update_min_zoom')
+    layer_name = params.required('source_layer')
+    start_zoom = params.optional('start_zoom', typ=int, default=0)
+    end_zoom = params.optional('end_zoom', typ=int)
+    min_zoom = params.required('min_zoom')
+    where = params.optional('where')
+
+    layer = _find_layer(ctx.feature_layers, layer_name)
+    zoom = ctx.nominal_zoom
+
+    if zoom < start_zoom or \
+       (end_zoom is not None and zoom >= end_zoom):
+        return None
+
+    min_zoom = compile(min_zoom, 'queries.yaml', 'eval')
+    if where:
+        where = compile(where, 'queries.yaml', 'eval')
+
+    new_features = []
+    for shape, props, fid in layer['features']:
+        local = defaultdict(lambda: None)
+        local.update(props)
+        local['zoom'] = zoom
+
+        if where and eval(where, {}, local):
+            new_min_zoom = eval(min_zoom, {}, local)
+            if new_min_zoom > props.get('min_zoom'):
+                props['min_zoom'] = new_min_zoom
+                if new_min_zoom >= zoom + 1 and zoom < 16:
+                    # DON'T add feature - it's masked by min zoom.
+                    continue
+
+        new_features.append((shape, props, fid))
+
+    layer['features'] = new_features
+    return layer
+
+
+def major_airport_detector(shape, props, fid, zoom):
+    if props.get('kind') == 'aerodrome':
+        passengers = props.get('passenger_count', 0)
+        kind_detail = props.get('kind_detail')
+
+        # if we didn't detect that the airport is international (probably
+        # missing tagging to indicate that), but it carries over a million
+        # passengers a year, then it's probably an airport in the same class
+        # as an international one.
+        #
+        # for example, TPE (Taipei) airport hasn't got any international
+        # tagging, but carries over 45 million passengers a year. however,
+        # CGH (Sao Paulo Congonhas) carries 21 million, but is actually a
+        # domestic airport -- however it's so large we'd probably want to
+        # display it at the same scale as an international airport.
+        if kind_detail != 'international' and passengers > 1000000:
+            props['kind_detail'] = 'international'
+
+        # likewise, if we didn't detect a kind detail, but the number of
+        # passengers suggests it's more than just a flying club airfield,
+        # then set a regional kind_detail.
+        elif kind_detail is None and passengers > 10000:
+            props['kind_detail'] = 'regional'
+
+    return shape, props, fid
+
+
+_NE_COUNTRY_CAPITALS = [
+    'Admin-0 region capital',
+    'Admin-0 capital alt',
+    'Admin-0 capital',
+]
+
+
+_NE_REGION_CAPITALS = [
+    'Admin-1 capital',
+    'Admin-1 region capital',
+]
+
+
+def capital_alternate_viewpoint(shape, props, fid, zoom):
+    """
+    Removes the fclass_* properties and replaces them with viewpoint overrides
+    for country_capital and region_capital.
+    """
+
+    fclass_prefix = 'fclass_'
+
+    default_country_capital = props.get('country_capital', False)
+    default_region_capital = props.get('region_capital', False)
+
+    for k in props.keys():
+        if k.startswith(fclass_prefix):
+            viewpoint = k[len(fclass_prefix):]
+            fclass = props.pop(k)
+
+            country_capital = fclass in _NE_COUNTRY_CAPITALS
+            region_capital = fclass in _NE_REGION_CAPITALS
+
+            if country_capital:
+                props['country_capital:' + viewpoint] = True
+
+            elif region_capital:
+                props['region_capital:' + viewpoint] = True
+
+            if default_country_capital and not country_capital:
+                props['country_capital:' + viewpoint] = False
+
+            elif default_region_capital and not region_capital:
+                props['region_capital:' + viewpoint] = False
+
+    return shape, props, fid

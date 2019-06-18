@@ -36,14 +36,15 @@ SELECT
   END AS __label__,
 
   -- common properties across all layers
-  to_jsonb(tags) || jsonb_build_object(
+  to_jsonb(tags) || extra_wikidata_properties(tags->'wikidata') || jsonb_build_object(
     'source', 'openstreetmap.org',
     'area', way_area
   ) AS __properties__,
 
   CASE WHEN mz_boundary_min_zoom IS NOT NULL
     THEN jsonb_build_object(
-      'min_zoom', mz_boundary_min_zoom
+      'min_zoom', mz_boundary_min_zoom,
+      'mz_boundary_from_polygon', TRUE
     )
   END AS __boundaries_properties__,
 

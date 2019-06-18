@@ -11,14 +11,48 @@ class FractionalPois(FixtureTest):
             {'id': 332223480, 'min_zoom': 15.31})
 
     def test_state_boundary(self):
-        self.load_fixtures([
-            'https://www.openstreetmap.org/relation/224951',
-            'https://www.openstreetmap.org/relation/61320',
-        ], clip=self.tile_bbox(9, 150, 192, padding=2))
+        import dsl
 
+        z, x, y, = 9, 150, 192
+
+        self.generate_fixtures(
+            # https://www.openstreetmap.org/relation/224951
+            dsl.way(-224951, dsl.tile_diagonal(z, x, y), {
+                'ISO3166-2': 'US-NJ',
+                'admin_level': '4',
+                'boundary': 'administrative',
+                'is_in:country_code': 'US',
+                'name': 'New Jersey',
+                'ref': 'NJ',
+                'ref:fips': '34',
+                'type': 'boundary',
+                'wikidata': 'Q1408',
+                'wikipedia': 'en:New Jersey',
+                'source': 'openstreetmap.org',
+                'mz_boundary_from_polygon': True,  # need this for hack
+            }),
+            # https://www.openstreetmap.org/relation/61320
+            dsl.way(-61320, dsl.tile_diagonal(z, x, y), {
+                'ISO3166-2': 'US-NY',
+                'admin_level': '4',
+                'alt_name': 'New York State',
+                'boundary': 'administrative',
+                'is_in:country_code': 'US',
+                'name': 'New York',
+                'ref': 'NY',
+                'ref:fips': '36',
+                'type': 'boundary',
+                'wikidata': 'Q1384',
+                'wikipedia': 'en:New York (state)',
+                'source': 'openstreetmap.org',
+                'mz_boundary_from_polygon': True,  # need this for hack
+            }),
+        )
+
+        # NOTE: might not have an ID if it has been merged
         self.assert_has_feature(
-            9, 150, 192, 'boundaries',
-            {'min_zoom': 8, 'id': -224951,
+            z, x, y, 'boundaries',
+            {'min_zoom': 8,
              'source': 'openstreetmap.org',
              'name': 'New Jersey - New York'})
 
@@ -29,9 +63,10 @@ class FractionalPois(FixtureTest):
 
         self.assert_has_feature(
             9, 150, 192, 'roads',
-            {'min_zoom': 8, 'sort_rank': 381,
+            {'min_zoom': 8, 'sort_rank': 380,
              'source': 'openstreetmap.org',
              'kind': 'major_road',
+             'kind_detail': 'primary',
              'network': 'US:NJ:Hudson'})
 
     def test_train_route(self):
@@ -82,7 +117,7 @@ class FractionalPoisNe(FixtureTest):
             fixtures.append(
                 'file://integration-test/fixtures/' +
                 table +
-                '/976-fractional-pois.shp')
+                '/976-fractional-pois2.shp')
 
         self.load_fixtures(fixtures)
 
@@ -91,7 +126,7 @@ class FractionalPoisNe(FixtureTest):
         # transit, and water
         self.assert_has_feature(
             5, 9, 12, 'boundaries',
-            {'min_zoom': 2, 'id': int,
+            {'min_zoom': 2,
              'source': 'naturalearthdata.com',
              'kind': 'region'})
 
@@ -101,17 +136,38 @@ class FractionalPoisNe(FixtureTest):
             {'min_zoom': 5, 'id': int, 'shield_text': '95',
              'source': 'naturalearthdata.com'})
 
-    def test_water(self):
-        # There is no transit data from Natural Earth
-        self.assert_has_feature(
-            7, 36, 50, 'water',
-            {'min_zoom': 0, 'id': int,
-             'source': 'naturalearthdata.com',
-             'name': 'John H. Kerr Reservoir'})
-
+    def test_water_osm(self):
         self.assert_has_feature(
             9, 150, 192, 'water',
             {'min_zoom': 0,
-             'source': 'openstreetmapdata.com',
+             'source': 'osmdata.openstreetmap.de',
              'kind': 'ocean',
              'name': type(None)})
+
+
+# move stuff into this class when it gets ported from fixture-based tests
+# above to generative tests. eventually the class above should be empty.
+class FractionalPoisNeGenerative(FixtureTest):
+
+    def test_water_ne(self):
+        import dsl
+
+        z, x, y = (7, 36, 50)
+
+        self.generate_fixtures(
+            dsl.way(1, dsl.tile_box(z, x, y), {
+                u'scalerank': 7,
+                u'source': u'naturalearthdata.com',
+                u'year': 1953,
+                u'featurecla': u'Reservoir',
+                u'name_abb': u'John H. Kerr Res.',
+                u'name': u'John H. Kerr Reservoir',
+                u'min_zoom': 7,
+            }),
+        )
+
+        self.assert_has_feature(
+            z, x, y, 'water',
+            {'min_zoom': 7, 'id': int,
+             'source': 'naturalearthdata.com',
+             'name': 'John H. Kerr Reservoir'})

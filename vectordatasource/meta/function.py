@@ -337,9 +337,9 @@ def mz_calculate_ferry_level(shape):
     return 13
 
 
-DECIMAL_UNIT_PATTERN = re.compile('([0-9]+(\.[0-9]*)?) *(mi|km|m|nmi|ft)$')
-IMPERIAL_PATTERN = re.compile('([0-9]+(\.[0-9]*)?)\' *(([0-9]+)")?')
-NUMERIC_PATTERN = re.compile('^([0-9]+(\.[0-9]*)?)$')
+DECIMAL_UNIT_PATTERN = re.compile(r'([0-9]+(\.[0-9]*)?) *(mi|km|m|nmi|ft)$')
+IMPERIAL_PATTERN = re.compile(r'([0-9]+(\.[0-9]*)?)\' *(([0-9]+)")?')
+NUMERIC_PATTERN = re.compile(r'^([0-9]+(\.[0-9]*)?)$')
 
 
 UNIT_CONVERSION_FACTORS = {
@@ -377,3 +377,65 @@ def mz_to_float_meters(length):
         return float(m.groups()[0])
 
     return None
+
+
+def tz_looks_like_service_area(name):
+    min_zoom = 17
+
+    if name is not None:
+        name = name.lower()
+        if name.endswith('service area') or \
+           name.endswith('services') or \
+           name.endswith('travel plaza'):
+            min_zoom = 13
+
+    return min_zoom
+
+
+def tz_looks_like_rest_area(name):
+    min_zoom = 17
+
+    if name is not None:
+        name = name.lower()
+        if name.endswith('rest area'):
+            min_zoom = 13
+
+    return min_zoom
+
+
+def tz_estimate_parking_capacity(capacity, parking, levels, way_area):
+    try:
+        # if the tags tell us what capacity is, then we should respect that.
+        capacity = int(capacity)
+        return capacity
+
+    except (ValueError, TypeError):
+        # sometimes people don't put integers in the capacity, which is kind of
+        # annoying. it means we just have to fall back to estimating.
+        pass
+
+    # estimate capacity based on way area fitting. looks like roughly 46 square
+    # mercator meters per space?
+    spaces_per_level = int(way_area / 46.0)
+
+    try:
+        levels = int(levels)
+
+    except (ValueError, TypeError):
+        # levels either not present, or non-numeric. try and guess from the
+        # parking type.
+        if parking == 'multi-storey':
+            # at least 2, but let's be conservative.
+            levels = 2
+        else:
+            # mainly surface, but also other types such as "underground"
+            levels = 1
+
+    capacity = spaces_per_level * levels
+
+    # if we get a silly answer, don't set that - just return None to indicate
+    # that we're unsure.
+    if capacity > 0:
+        return capacity
+    else:
+        return None
